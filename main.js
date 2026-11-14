@@ -248,38 +248,31 @@ async function adjustDailyPot(delta) {
   }
 }
 
-async function getOrCreateAndIncrementPot() {
-  const row = await fetchPersistentPotRow();
-  if (!row) return false;
-  const nextAmount = Number(row.pot_amount ?? 10) + 1;
-  const updated = await supabase.from('daily_pots').update({ pot_amount: nextAmount, updated_at: new Date().toISOString() }).eq('date_key', GLOBAL_POT_KEY).select('*').single();
-  logSupabaseError('increment persistent pot', updated.error);
-  if (updated.data) livePot = Number(updated.data.pot_amount);
-  renderHud();
-  return !updated.error;
-}
-
-async function changeCoins(delta) {
-  if (!profile || !delta) return;
-  const nextCoins = Number(profile.coins) + delta;
-  const { data, error } = await supabase.from('profiles').update({ coins: nextCoins }).eq('tag', profile.tag).select('coins').maybeSingle();
-  logSupabaseError('update profile Coins', error);
-  profile.coins = data ? Number(data.coins) : nextCoins;
-  save('cotd_profile', profile);
-  renderHud();
-}
-
-async function adjustDailyPot(delta) {
-  if (!delta) return;
-  const row = await fetchPersistentPotRow();
-  if (!row) return;
-  const amount = Math.max(0, Number(row.pot_amount ?? 0) + delta);
-  const { data, error } = await supabase.from('daily_pots').update({ pot_amount: amount, updated_at: new Date().toISOString() }).eq('date_key', GLOBAL_POT_KEY).select('pot_amount').single();
-  logSupabaseError('adjust persistent pot', error);
+async function findProfileForDevice() {
+  const { data, error } = await supabase.from('profiles').select('*').eq('device_id', deviceId).maybeSingle();
+  logSupabaseError('find profile by device_id', error);
   if (data) {
-    livePot = Number(data.pot_amount);
-    renderHud();
+    profile = mapProfile(data);
+    save('cotd_profile', profile);
+    if (game?.playerTag && game.playerTag !== profile.tag) {
+      game = null;
+      save('cotd_game', null);
+    }
   }
+}
+
+function makeDeviceId() {
+  if (crypto.randomUUID) return crypto.randomUUID();
+  return `device-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function rng(seed) {
+  return () => {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
 }
 
 function makeDeck(seedStr) {
@@ -433,80 +426,64 @@ function renderHome() {
   const main = root.querySelector('#main');
   main.innerHTML = `<div class="felt">
     <button class="btn" id="daily" style="width:100%" ${alreadyPlayed ? 'disabled' : ''}>Crib of the Day ${alreadyPlayed ? '(done today)' : '· 1 Coin'}</button>
+    <div id="daily-setup" style="display:none; margin-top:10px; padding:12px; border:1px solid #f3d27a; border-radius:10px; background:rgba(0,0,0,.35);">
+      <div class="eyebrow">CRIB OF THE DAY · 1 COIN ENTRY</div>
+      <p style="margin:4px 0 8px;">Predict your final score (0–120). Exact match wins +5 bonus Coins!</p>
+      <div class="row" style="margin:6px 0;">
+        <input id="prediction-input" type="number" min="0" max="120" step="1" value="35" style="flex:1; font-size:18px; text-align:center;">
+        <button class="btn gold-btn" id="lock-daily" type="button" style="flex:1.4;">Lock In &amp; Deal</button>
+      </div>
+      <p class="error-text" id="prediction-error" style="margin:4px 0 0;"></p>
+    </div>
     <div class="row"><button class="btn" id="free" style="flex:1">Free Play</button><button class="btn" id="lb" style="flex:1">Boards & Stats</button></div>
     <label class="row">Auto-Fill Row 1 <input type="checkbox" id="af" ${settings.autofill ? 'checked' : ''}></label>
     <label class="row">Shoot the Moon (≤10 pts) <input type="checkbox" id="moon"></label></div>`;
+
   main.querySelector('#af').onchange = e => { settings.autofill = e.target.checked; save('cotd_settings', settings); };
   const moonBox = main.querySelector('#moon');
+  const dailySetup = main.querySelector('#daily-setup');
+  const predInput = main.querySelector('#prediction-input');
+  const lockBtn = main.querySelector('#lock-daily');
+  const errorBox = main.querySelector('#prediction-error');
+
   main.querySelector('#free').onclick = () => startGame('free', moonBox.checked, null);
   main.querySelector('#lb').onclick = showBoards;
+
   main.querySelector('#daily').onclick = () => {
     if (hasPlayedDailyToday()) { renderHome(); return; }
-    showPredictionModal(moonBox.checked);
+    const isOpen = dailySetup.style.display === 'block';
+    dailySetup.style.display = isOpen ? 'none' : 'block';
+    if (!isOpen) predInput.focus();
   };
-}
 
-function showPredictionModal(moon) {
-  if (hasPlayedDailyToday()) return;
-  document.querySelectorAll('.prediction-overlay').forEach(node => node.remove());
-
-  const layer = el(`<div class="overlay prediction-overlay">
-    <div class="modal prediction-card">
-      <button class="modal-x" id="close-pred" type="button" aria-label="Close">✕</button>
-      <form id="prediction-form">
-        <span class="eyebrow">CRIB OF THE DAY</span>
-        <h2>Call your score</h2>
-        <p>Lock in a whole-number prediction before the deal. Exact match earns +5 bonus Coins.</p>
-        <label for="prediction-input">Your predicted score (0–120)</label>
-        <input id="prediction-input" type="number" min="0" max="120" step="1" value="35" required>
-        <p class="error-text" id="prediction-error" aria-live="polite"></p>
-        <button class="btn gold-btn" type="submit">Lock Prediction &amp; Deal</button>
-      </form>
-    </div>
-  </div>`);
-
-  const closePred = () => { if (!dailyStarting) layer.remove(); };
-  layer.querySelector('#close-pred').onclick = closePred;
-  layer.addEventListener('click', e => { if (e.target === layer) closePred(); });
-
-  const form = layer.querySelector('#prediction-form');
-  form.addEventListener('submit', async e => {
-    e.preventDefault();
+  lockBtn.onclick = async () => {
     if (hasPlayedDailyToday() || dailyStarting) return;
-
-    const input = layer.querySelector('#prediction-input');
-    const raw = input.value.trim();
+    const raw = predInput.value.trim();
     const predictedScore = Number(raw);
-    const error = layer.querySelector('#prediction-error');
     if (!/^\d+$/.test(raw) || !Number.isInteger(predictedScore) || predictedScore < 0 || predictedScore > 120) {
-      error.textContent = 'Enter a whole-number score from 0 to 120.';
+      errorBox.textContent = 'Enter a whole number from 0 to 120.';
       return;
     }
 
     dailyStarting = true;
-    const submitBtn = form.querySelector('button[type="submit"]');
-    submitBtn.disabled = true;
-    submitBtn.textContent = 'Preparing your deal…';
+    lockBtn.disabled = true;
+    lockBtn.textContent = 'Dealing…';
 
     const cloudOk = await getOrCreateAndIncrementPot();
     if (!cloudOk) {
-      error.textContent = 'Could not update the Pot. Please try again.';
+      errorBox.textContent = 'Could not update the Pot. Try again.';
       dailyStarting = false;
-      submitBtn.disabled = false;
-      submitBtn.textContent = 'Lock Prediction & Deal';
+      lockBtn.disabled = false;
+      lockBtn.textContent = 'Lock In & Deal';
       return;
     }
 
     await changeCoins(-1);
     localStorage.setItem(`cotd_daily_${profile.tag}`, todayKey());
     localStorage.setItem('cotd_daily', todayKey());
-    layer.remove();
     dailyStarting = false;
-    startGame('daily', moon, predictedScore);
-  });
-
-  document.body.appendChild(layer);
-  layer.querySelector('#prediction-input').focus();
+    startGame('daily', moonBox.checked, predictedScore);
+  };
 }
 
 function startGame(mode, moon, predictedScore) {
