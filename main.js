@@ -168,52 +168,58 @@ function mapGame(row) {
   };
 }
 
+const GLOBAL_POT_KEY = 'global';
+
+async function fetchPersistentPotRow() {
+  // Prefer the persistent 'global' row; if not created yet, seed it from the most recent pot row or 10
+  let { data: row, error } = await supabase.from('daily_pots').select('*').eq('date_key', GLOBAL_POT_KEY).maybeSingle();
+  logSupabaseError('load persistent pot', error);
+
+  if (!row && !error) {
+    const latest = await supabase.from('daily_pots').select('pot_amount').order('updated_at', { ascending: false }).limit(1).maybeSingle();
+    const startingAmount = Number(latest.data?.pot_amount ?? 10);
+    const created = await supabase.from('daily_pots').insert({ date_key: GLOBAL_POT_KEY, pot_amount: startingAmount, settled: false }).select('*').single();
+    logSupabaseError('create persistent pot', created.error);
+    row = created.data;
+    if (!row && created.error?.code === '23505') {
+      const retry = await supabase.from('daily_pots').select('*').eq('date_key', GLOBAL_POT_KEY).single();
+      row = retry.data;
+    }
+  }
+  return row;
+}
+
 async function refreshCloudData() {
-  const [gamesRes, profilesRes, potRes, championsRes] = await Promise.all([
+  const [gamesRes, profilesRes, potRow, championsRes] = await Promise.all([
     supabase.from('games').select('*').order('created_at', { ascending: false }),
     supabase.from('profiles').select('*').order('tag'),
-    supabase.from('daily_pots').select('*').eq('date_key', todayKey()).maybeSingle(),
+    fetchPersistentPotRow(),
     supabase.from('daily_champions').select('*').order('date_key', { ascending: false }),
   ]);
   logSupabaseError('load games', gamesRes.error);
   logSupabaseError('load profiles', profilesRes.error);
-  logSupabaseError('load today\'s daily pot', potRes.error);
   logSupabaseError('load daily champions', championsRes.error);
   if (gamesRes.data) allGames = gamesRes.data.map(mapGame);
   if (profilesRes.data) profiles = profilesRes.data.map(mapProfile);
-  if (potRes.data) livePot = Number(potRes.data.pot_amount ?? 10);
-  else if (!potRes.error) livePot = 10;
+  if (potRow) livePot = Number(potRow.pot_amount ?? 10);
   if (championsRes.data) champions = championsRes.data;
   renderHud();
 }
 
 async function refreshLivePot() {
-  const { data, error } = await supabase.from('daily_pots').select('pot_amount').eq('date_key', todayKey()).maybeSingle();
-  logSupabaseError('refresh daily pot', error);
-  if (data) {
-    livePot = Number(data.pot_amount ?? 10);
+  const row = await fetchPersistentPotRow();
+  if (row) {
+    livePot = Number(row.pot_amount ?? 10);
     renderHud();
   }
 }
 
 async function getOrCreateAndIncrementPot() {
-  const dateKey = todayKey();
-  let { data: row, error } = await supabase.from('daily_pots').select('*').eq('date_key', dateKey).maybeSingle();
-  logSupabaseError('fetch daily pot before entry', error);
-  if (!row) {
-    const created = await supabase.from('daily_pots').insert({ date_key: dateKey, pot_amount: 10, settled: false }).select('*').single();
-    logSupabaseError('create daily pot', created.error);
-    row = created.data;
-    if (!row && created.error?.code === '23505') {
-      const retry = await supabase.from('daily_pots').select('*').eq('date_key', dateKey).single();
-      logSupabaseError('refetch existing daily pot', retry.error);
-      row = retry.data;
-    }
-  }
+  const row = await fetchPersistentPotRow();
   if (!row) return false;
   const nextAmount = Number(row.pot_amount ?? 10) + 1;
-  const updated = await supabase.from('daily_pots').update({ pot_amount: nextAmount, updated_at: new Date().toISOString() }).eq('date_key', dateKey).select('*').single();
-  logSupabaseError('increment daily pot', updated.error);
+  const updated = await supabase.from('daily_pots').update({ pot_amount: nextAmount, updated_at: new Date().toISOString() }).eq('date_key', GLOBAL_POT_KEY).select('*').single();
+  logSupabaseError('increment persistent pot', updated.error);
   if (updated.data) livePot = Number(updated.data.pot_amount);
   renderHud();
   return !updated.error;
@@ -231,44 +237,49 @@ async function changeCoins(delta) {
 
 async function adjustDailyPot(delta) {
   if (!delta) return;
-  const dateKey = todayKey();
-  const { data: row, error: readError } = await supabase.from('daily_pots').select('pot_amount').eq('date_key', dateKey).maybeSingle();
-  logSupabaseError('read daily pot for adjustment', readError);
+  const row = await fetchPersistentPotRow();
   if (!row) return;
   const amount = Math.max(0, Number(row.pot_amount ?? 0) + delta);
-  const { data, error } = await supabase.from('daily_pots').update({ pot_amount: amount, updated_at: new Date().toISOString() }).eq('date_key', dateKey).select('pot_amount').single();
-  logSupabaseError('adjust daily pot', error);
+  const { data, error } = await supabase.from('daily_pots').update({ pot_amount: amount, updated_at: new Date().toISOString() }).eq('date_key', GLOBAL_POT_KEY).select('pot_amount').single();
+  logSupabaseError('adjust persistent pot', error);
   if (data) {
     livePot = Number(data.pot_amount);
     renderHud();
   }
 }
 
-async function findProfileForDevice() {
-  const { data, error } = await supabase.from('profiles').select('*').eq('device_id', deviceId).maybeSingle();
-  logSupabaseError('find profile by device_id', error);
+async function getOrCreateAndIncrementPot() {
+  const row = await fetchPersistentPotRow();
+  if (!row) return false;
+  const nextAmount = Number(row.pot_amount ?? 10) + 1;
+  const updated = await supabase.from('daily_pots').update({ pot_amount: nextAmount, updated_at: new Date().toISOString() }).eq('date_key', GLOBAL_POT_KEY).select('*').single();
+  logSupabaseError('increment persistent pot', updated.error);
+  if (updated.data) livePot = Number(updated.data.pot_amount);
+  renderHud();
+  return !updated.error;
+}
+
+async function changeCoins(delta) {
+  if (!profile || !delta) return;
+  const nextCoins = Number(profile.coins) + delta;
+  const { data, error } = await supabase.from('profiles').update({ coins: nextCoins }).eq('tag', profile.tag).select('coins').maybeSingle();
+  logSupabaseError('update profile Coins', error);
+  profile.coins = data ? Number(data.coins) : nextCoins;
+  save('cotd_profile', profile);
+  renderHud();
+}
+
+async function adjustDailyPot(delta) {
+  if (!delta) return;
+  const row = await fetchPersistentPotRow();
+  if (!row) return;
+  const amount = Math.max(0, Number(row.pot_amount ?? 0) + delta);
+  const { data, error } = await supabase.from('daily_pots').update({ pot_amount: amount, updated_at: new Date().toISOString() }).eq('date_key', GLOBAL_POT_KEY).select('pot_amount').single();
+  logSupabaseError('adjust persistent pot', error);
   if (data) {
-    profile = mapProfile(data);
-    save('cotd_profile', profile);
-    if (game?.playerTag && game.playerTag !== profile.tag) {
-      game = null;
-      save('cotd_game', null);
-    }
+    livePot = Number(data.pot_amount);
+    renderHud();
   }
-}
-
-function makeDeviceId() {
-  if (crypto.randomUUID) return crypto.randomUUID();
-  return `device-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-}
-
-function rng(seed) {
-  return () => {
-    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
-    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
-    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
-    return ((t ^ t >>> 14) >>> 0) / 4294967296;
-  };
 }
 
 function makeDeck(seedStr) {
@@ -361,13 +372,20 @@ function render() {
   renderHud();
   if (game) renderBoard(); else renderHome();
 }
+function hasPlayedDailyToday() {
+  if (!profile) return false;
+  const localKey = `cotd_daily_${profile.tag}`;
+  return localStorage.getItem(localKey) === todayKey()
+    || localStorage.getItem('cotd_daily') === todayKey()
+    || allGames.some(g => g.playerTag === profile.tag && g.dateKey === todayKey() && (g.mode === 'daily' || (g.isMoonShot && g.coinsDelta !== 0)));
+}
 
 function renderHud() {
   const hud = root.querySelector('#hud');
   if (!hud || !profile) return;
   const showPot = !game || game.mode === 'daily';
   hud.innerHTML = `<span class="pill">${escapeHTML(profile.tag)}</span><span class="pill">🪙 ${Number(profile.coins)} Coins</span>` +
-    (showPot ? `<span class="pill">Daily Pot ${livePot} · Pot 1 ${Math.round(livePot * .4)} · Pot 2 ${Math.round(livePot * .6)}</span>` : '') +
+    (showPot ? `<span class="pill">Daily Pot: ${livePot} Coins</span>` : '') +
     (game?.mode === 'daily' && !game.done && Number.isInteger(game.predictedScore) ? `<span class="pill prediction-pill">Prediction: ${game.predictedScore} pts</span>` : '');
 }
 
@@ -411,7 +429,7 @@ function renderSignup() {
 }
 
 function renderHome() {
-  const alreadyPlayed = localStorage.getItem('cotd_daily') === todayKey() || allGames.some(g => g.playerTag === profile.tag && g.dateKey === todayKey() && g.mode === 'daily');
+  const alreadyPlayed = hasPlayedDailyToday();
   const main = root.querySelector('#main');
   main.innerHTML = `<div class="felt">
     <button class="btn" id="daily" style="width:100%" ${alreadyPlayed ? 'disabled' : ''}>Crib of the Day ${alreadyPlayed ? '(done today)' : '· 1 Coin'}</button>
@@ -422,14 +440,40 @@ function renderHome() {
   const moonBox = main.querySelector('#moon');
   main.querySelector('#free').onclick = () => startGame('free', moonBox.checked, null);
   main.querySelector('#lb').onclick = showBoards;
-  main.querySelector('#daily').onclick = () => showPredictionModal(moonBox.checked);
+  main.querySelector('#daily').onclick = () => {
+    if (hasPlayedDailyToday()) { renderHome(); return; }
+    showPredictionModal(moonBox.checked);
+  };
 }
 
 function showPredictionModal(moon) {
-  const layer = el(`<div class="modal prediction-modal"><form class="felt prediction-card"><span class="eyebrow">CRIB OF THE DAY</span><h2>Call your score</h2><p>Lock in an integer prediction before the deal. Exact match earns 5 bonus Coins.</p><label for="prediction-input">Your predicted score</label><input id="prediction-input" type="number" min="0" max="120" step="1" value="20" required><p class="error-text" id="prediction-error" aria-live="polite"></p><button class="btn gold-btn" type="submit">Lock Prediction &amp; Deal</button></form></div>`);
-  const form = layer.querySelector('form');
+  if (hasPlayedDailyToday()) return;
+  document.querySelectorAll('.prediction-overlay').forEach(node => node.remove());
+
+  const layer = el(`<div class="overlay prediction-overlay">
+    <div class="modal prediction-card">
+      <button class="modal-x" id="close-pred" type="button" aria-label="Close">✕</button>
+      <form id="prediction-form">
+        <span class="eyebrow">CRIB OF THE DAY</span>
+        <h2>Call your score</h2>
+        <p>Lock in a whole-number prediction before the deal. Exact match earns +5 bonus Coins.</p>
+        <label for="prediction-input">Your predicted score (0–120)</label>
+        <input id="prediction-input" type="number" min="0" max="120" step="1" value="35" required>
+        <p class="error-text" id="prediction-error" aria-live="polite"></p>
+        <button class="btn gold-btn" type="submit">Lock Prediction &amp; Deal</button>
+      </form>
+    </div>
+  </div>`);
+
+  const closePred = () => { if (!dailyStarting) layer.remove(); };
+  layer.querySelector('#close-pred').onclick = closePred;
+  layer.addEventListener('click', e => { if (e.target === layer) closePred(); });
+
+  const form = layer.querySelector('#prediction-form');
   form.addEventListener('submit', async e => {
     e.preventDefault();
+    if (hasPlayedDailyToday() || dailyStarting) return;
+
     const input = layer.querySelector('#prediction-input');
     const raw = input.value.trim();
     const predictedScore = Number(raw);
@@ -438,24 +482,29 @@ function showPredictionModal(moon) {
       error.textContent = 'Enter a whole-number score from 0 to 120.';
       return;
     }
-    if (dailyStarting) return;
+
     dailyStarting = true;
-    form.querySelector('button').disabled = true;
-    form.querySelector('button').textContent = 'Preparing your deal…';
+    const submitBtn = form.querySelector('button[type="submit"]');
+    submitBtn.disabled = true;
+    submitBtn.textContent = 'Preparing your deal…';
+
     const cloudOk = await getOrCreateAndIncrementPot();
     if (!cloudOk) {
-      error.textContent = 'Could not update today’s Pot. Please try again.';
+      error.textContent = 'Could not update the Pot. Please try again.';
       dailyStarting = false;
-      form.querySelector('button').disabled = false;
-      form.querySelector('button').textContent = 'Lock Prediction & Deal';
+      submitBtn.disabled = false;
+      submitBtn.textContent = 'Lock Prediction & Deal';
       return;
     }
+
     await changeCoins(-1);
+    localStorage.setItem(`cotd_daily_${profile.tag}`, todayKey());
     localStorage.setItem('cotd_daily', todayKey());
     layer.remove();
     dailyStarting = false;
     startGame('daily', moon, predictedScore);
   });
+
   document.body.appendChild(layer);
   layer.querySelector('#prediction-input').focus();
 }
