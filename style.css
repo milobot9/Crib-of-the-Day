@@ -917,9 +917,9 @@ html, body {
 
 .sab-pool {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 8px;
-  margin: 8px 0;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+  margin: 10px 0;
 }
 
 .sab-slot {
@@ -928,8 +928,28 @@ html, body {
   align-items: center;
 }
 
+.sab-slot .card {
+  width: 100%;
+  aspect-ratio: 5 / 7;
+  height: auto;
+  min-height: 92px;
+  cursor: pointer;
+}
+
+.sab-slot .card .r {
+  font-size: 26px;
+  top: 6px;
+  left: 8px;
+}
+
+.sab-slot .card .s {
+  font-size: 28px;
+  bottom: 6px;
+  right: 8px;
+}
+
 .card.sab-burn {
-  outline: 2px solid #ff5c5c;
-  box-shadow: 0 0 12px rgba(255, 92, 92, 0.85);
-  transform: translateY(-2px);
+  outline: 3px solid #ff5c5c;
+  box-shadow: 0 0 14px rgba(255, 92, 92, 0.9);
+  transform: translateY(-3px);
 }

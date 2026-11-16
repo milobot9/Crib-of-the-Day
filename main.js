@@ -1613,17 +1613,17 @@ function showResult() {
         <p style="font-size:12px; margin:0 0 6px; opacity:.9;">
           If your opponent tries to burn any of your shielded cards, the burn fizzles! Rows shield <b>5 cards</b> (incl. Crib); Columns shield <b>4 cards</b>.
         </p>
-        <div style="display:flex; gap:5px; flex-wrap:wrap; margin-bottom:4px;">
-          ${[0, 1, 2, 3].map(r => `<button type="button" class="btn small ${shieldChoice?.type === 'row' && shieldChoice.idx === r ? 'gold-btn' : ''}" data-sh-type="row" data-sh-idx="${r}">Row ${r + 1} (5)</button>`).join('')}
+        <div style="display:flex; gap:6px; flex-wrap:wrap; margin-bottom:6px;">
+          ${[0, 1, 2, 3].map(r => `<button type="button" class="btn small ${shieldChoice?.type === 'row' && shieldChoice.idx === r ? 'gold-btn' : ''}" data-sh-type="row" data-sh-idx="${r}">Row ${r + 1}</button>`).join('')}
         </div>
-        <div style="display:flex; gap:5px; flex-wrap:wrap; margin-bottom:10px;">
-          ${[0, 1, 2, 3].map(c => `<button type="button" class="btn small ${shieldChoice?.type === 'col' && shieldChoice.idx === c ? 'gold-btn' : ''}" data-sh-type="col" data-sh-idx="${c}">Hand ${c + 1} (4)</button>`).join('')}
+        <div style="display:flex; gap:6px; flex-wrap:wrap; margin-bottom:10px;">
+          ${[0, 1, 2, 3].map(c => `<button type="button" class="btn small ${shieldChoice?.type === 'col' && shieldChoice.idx === c ? 'gold-btn' : ''}" data-sh-type="col" data-sh-idx="${c}">Hand ${c + 1}</button>`).join('')}
         </div>
-        ${shieldChoice ? `<div style="font-size:12px; color:#7cc4ff; margin-bottom:10px;">🛡️ Shielded (${shieldCards.length}): <b>${shieldCards.map(formatCardText).join(', ')}</b></div>` : ''}
+        ${shieldChoice ? `<div style="font-size:12px; color:#7cc4ff; margin-bottom:10px;">🛡️ Shielded: <b>${shieldCards.map(formatCardText).join(', ')}</b></div>` : ''}
 
         <h3 style="margin:6px 0 4px; color:#f3d27a;">2. Burn ${cfg.burn} of ${cfg.pool} Rival Cards &amp; Expose ${cfg.chooseReveal}</h3>
         <p style="font-size:12px; margin:0 0 8px; opacity:.9;">
-          Tap <b>${cfg.burn}</b> cards to burn (${burnSelection.length}/${cfg.burn}), then tap <b>👁️ Expose</b> on <b>${cfg.chooseReveal}</b> of them (${revealSelection.length}/${cfg.chooseReveal})${cfg.randomReveal ? ` — plus <b>${cfg.randomReveal} random</b> burned card will leak` : ''}.
+          Tap <b>${cfg.burn}</b> cards to burn (${burnSelection.length}/${cfg.burn}), then tap <b>👁️</b> on <b>${cfg.chooseReveal}</b> to expose (${revealSelection.length}/${cfg.chooseReveal})${cfg.randomReveal ? ` + <b>${cfg.randomReveal} random</b> leaks` : ''}.
         </p>
         <div class="sab-pool">
           ${game.sabotagePool.map((c, idx) => {
@@ -1631,10 +1631,10 @@ function showResult() {
             const isExposed = revealSelection.includes(idx);
             const red = c.s === 1 || c.s === 2;
             return `<div class="sab-slot">
-              <div class="card ${red ? 'red' : 'blk'} ${isBurned ? 'sab-burn' : ''}" data-sab-card="${idx}" style="cursor:pointer; margin:auto;">
+              <div class="card ${red ? 'red' : 'blk'} ${isBurned ? 'sab-burn' : ''}" data-sab-card="${idx}">
                 <span class="r">${RANKS[c.r - 1]}</span><span class="s">${SUITS[c.s]}</span>
               </div>
-              ${isBurned ? `<button type="button" class="btn small ${isExposed ? 'gold-btn' : ''}" data-sab-eye="${idx}" style="margin-top:4px; padding:3px 6px; font-size:11px;">${isExposed ? '👁️ Shown' : '🙈 Hide'}</button>` : '<div style="height:26px;"></div>'}
+              ${isBurned ? `<button type="button" class="btn small ${isExposed ? 'gold-btn' : ''}" data-sab-eye="${idx}" style="margin-top:6px; padding:4px 8px; min-height:30px; font-size:12px; width:100%;">${isExposed ? '👁️ Shown' : '🙈 Hide'}</button>` : '<div style="height:36px;"></div>'}
             </div>`;
           }).join('')}
         </div>
