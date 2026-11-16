@@ -25,17 +25,71 @@ const hotPlaylist = [
 const gamblerTrack = 'assets/audio/The Gambler.mp3';
 const loserTrack = 'assets/audio/Im A Loser (Remastered 2009).mp3';
 const championTrack = 'assets/audio/We Are The Champions (Remastered 2011).mp3';
+const diesIraeTrack = 'assets/audio/dies-irae.mp3';
+const lacrimosaTrack = 'assets/audio/lacrimosa.mp3';
 
-const EGG_COOLDOWN_MS = 30 * 60 * 1000;      // 30-min cooldown for single-song Easter eggs
-const HOT_COOLDOWN_MS = 15 * 60 * 1000;      // 15-min cooldown for the 7-hand hot-streak playlist
+const EGG_COOLDOWN_MS = 30 * 60 * 1000;
+const HOT_COOLDOWN_MS = 15 * 60 * 1000;
+const TARGET_VOL = 0.35;
 
 let trackIdx = Math.floor(Math.random() * playlist.length);
 let playingSpecialTrack = false;
 let hotStreakQueue = [];
 
-const music = new Audio(playlist[trackIdx]);
-music.volume = 0.35;
-music.preload = 'auto';
+const deckA = new Audio(playlist[trackIdx]);
+const deckB = new Audio();
+deckA.volume = TARGET_VOL;
+deckB.volume = 0;
+deckA.preload = 'auto';
+deckB.preload = 'auto';
+let activeDeck = deckA;
+let fadeTimer = null;
+
+const music = {
+  get paused() { return activeDeck.paused; },
+  play() { return activeDeck.play(); },
+  pause() {
+    clearInterval(fadeTimer);
+    deckA.pause();
+    deckB.pause();
+  },
+};
+
+function crossfadeTo(src, isSpecial = false) {
+  if (!settings.music) return;
+  const outgoing = activeDeck;
+  const incoming = activeDeck === deckA ? deckB : deckA;
+  activeDeck = incoming;
+  playingSpecialTrack = isSpecial;
+
+  clearInterval(fadeTimer);
+  incoming.src = src;
+  incoming.volume = 0;
+  incoming.load();
+
+  incoming.play().then(() => {
+    const steps = 20;
+    const stepMs = 75;
+    let step = 0;
+    const startOutVol = outgoing.volume;
+
+    fadeTimer = setInterval(() => {
+      step++;
+      const ratio = Math.min(1, step / steps);
+      incoming.volume = Number((TARGET_VOL * ratio).toFixed(3));
+      outgoing.volume = Number((startOutVol * (1 - ratio)).toFixed(3));
+      if (step >= steps) {
+        clearInterval(fadeTimer);
+        outgoing.pause();
+        outgoing.volume = 0;
+      }
+    }, stepMs);
+  }).catch(() => {
+    activeDeck = outgoing;
+    window.addEventListener('pointerdown', ensureMusicPlaying, { once: true });
+    window.addEventListener('keydown', ensureMusicPlaying, { once: true });
+  });
+}
 
 function canTriggerEgg(key, cooldownMs = EGG_COOLDOWN_MS) {
   const last = Number(localStorage.getItem('egg_cd_' + key) || 0);
@@ -46,50 +100,59 @@ function playSpecialTrack(src, cooldownKey, cooldownMs = EGG_COOLDOWN_MS) {
   if (!settings.music) return;
   if (cooldownKey) localStorage.setItem('egg_cd_' + cooldownKey, String(Date.now()));
   hotStreakQueue = [];
-  playingSpecialTrack = true;
-  music.src = src;
-  music.play().catch(() => {});
+  crossfadeTo(src, true);
 }
 
 function startHotPlaylist() {
   if (!settings.music || hotPlaylist.length === 0) return;
   localStorage.setItem('egg_cd_hotstreak', String(Date.now()));
-  playingSpecialTrack = true;
-  hotStreakQueue = hotPlaylist.slice(1); // queue tracks 2, 3, and 4
-  music.src = hotPlaylist[0];            // start track 1 immediately
-  music.play().catch(() => {});
+  hotStreakQueue = hotPlaylist.slice(1);
+  crossfadeTo(hotPlaylist[0], true);
 }
 
-music.addEventListener('ended', () => {
-  // 1. If we're mid-way through the 4-track hot streak playlist, play the next queued track
+function handleTrackEnded() {
   if (hotStreakQueue.length > 0) {
     const nextHot = hotStreakQueue.shift();
-    playingSpecialTrack = true;
-    music.src = nextHot;
-    if (settings.music) music.play().catch(() => {});
+    crossfadeTo(nextHot, true);
     return;
   }
-
-  // 2. Otherwise roll 1% chance for The Gambler, or return to the normal lounge playlist
   if (!playingSpecialTrack && Math.random() < 0.01 && canTriggerEgg('gambler')) {
     playSpecialTrack(gamblerTrack, 'gambler');
   } else {
-    playingSpecialTrack = false;
     trackIdx = (trackIdx + 1) % playlist.length;
-    music.src = playlist[trackIdx];
-    if (settings.music) music.play().catch(() => {});
+    crossfadeTo(playlist[trackIdx], false);
   }
+}
+
+[deckA, deckB].forEach(deck => {
+  deck.addEventListener('ended', () => { if (deck === activeDeck) handleTrackEnded(); });
+  deck.addEventListener('error', () => { if (deck === activeDeck && settings.music) setTimeout(handleTrackEnded, 500); });
 });
 
 function checkEasterEggTriggers(finalScore, isMoon, recentScores) {
-  // 1. Big Single-Game Win ("We Are the Champions"): Shoot the Moon (<= 10) OR 56+ pts in Standard
+  // 1. 3 Straight Under-22 Standard Games -> Dies Irae or Lacrimosa
+  if (!isMoon && recentScores.length >= 3) {
+    const lastThree = recentScores.slice(-3);
+    if (lastThree.every(s => s < 22)) {
+      const tragicTracks = [];
+      if (canTriggerEgg('dies_irae')) tragicTracks.push({ src: diesIraeTrack, key: 'dies_irae' });
+      if (canTriggerEgg('lacrimosa')) tragicTracks.push({ src: lacrimosaTrack, key: 'lacrimosa' });
+      if (tragicTracks.length > 0) {
+        const pick = tragicTracks[Math.floor(Math.random() * tragicTracks.length)];
+        playSpecialTrack(pick.src, pick.key);
+        return;
+      }
+    }
+  }
+
+  // 2. Big Single-Game Win ("We Are the Champions"): Shoot the Moon (<= 10) OR 56+ pts in Standard
   const bigWin = isMoon ? finalScore <= 10 : finalScore >= 56;
   if (bigWin && canTriggerEgg('champion')) {
     playSpecialTrack(championTrack, 'champion');
     return;
   }
 
-  // 2. 7-Hand Hot Streak Playlist: Average > 34 over past 7 hands (15-min cooldown)
+  // 3. 7-Hand Hot Streak Playlist: Average > 34 over past 7 hands
   if (!isMoon && recentScores.length >= 7 && hotStreakQueue.length === 0 && canTriggerEgg('hotstreak', HOT_COOLDOWN_MS)) {
     const lastSeven = recentScores.slice(-7);
     const avg7 = lastSeven.reduce((sum, v) => sum + v, 0) / 7;
@@ -99,7 +162,7 @@ function checkEasterEggTriggers(finalScore, isMoon, recentScores) {
     }
   }
 
-  // 3. 8-Game Cold Slump ("The Gambler" or "I'm a Loser"): Average < 30 over last 8 games
+  // 4. 8-Game Cold Slump ("The Gambler" or "I'm a Loser"): Average < 30 over last 8 games
   if (recentScores.length >= 8) {
     const lastEight = recentScores.slice(-8);
     const avg8 = lastEight.reduce((sum, v) => sum + v, 0) / 8;
@@ -131,6 +194,8 @@ let champions = [];
 let livePot = 10;
 let deviceId = localStorage.getItem('cotd_device_id');
 let dailyStarting = false;
+let allChallenges = [];
+let active1v1Id = null;
 
 function todayKey() {
   const d = new Date();
@@ -190,21 +255,29 @@ async function fetchPersistentPotRow() {
 }
 
 async function refreshCloudData() {
-  const [gamesRes, profilesRes, potRow, championsRes] = await Promise.all([
+  const [gamesRes, profilesRes, potRow, championsRes, challengesRes] = await Promise.all([
     supabase.from('games').select('*').order('created_at', { ascending: false }),
     supabase.from('profiles').select('*').order('tag'),
     fetchPersistentPotRow(),
     supabase.from('daily_champions').select('*').order('date_key', { ascending: false }),
+    supabase.from('challenges_1v1').select('*').order('created_at', { ascending: false }),
   ]);
   logSupabaseError('load games', gamesRes.error);
   logSupabaseError('load profiles', profilesRes.error);
   logSupabaseError('load daily champions', championsRes.error);
+  logSupabaseError('load 1v1 challenges', challengesRes.error);
   if (gamesRes.data) allGames = gamesRes.data.map(mapGame);
   if (profilesRes.data) profiles = profilesRes.data.map(mapProfile);
   if (potRow) livePot = Number(potRow.pot_amount ?? 10);
   if (championsRes.data) champions = championsRes.data;
+  if (challengesRes.data) allChallenges = challengesRes.data;
   renderHud();
 }
+
+function best3Of4Avg(scores) {
+  const sorted = [...scores].map(Number).sort((a, b) => b - a).slice(0, 3);
+  return sorted.reduce((a, b) => a + b, 0) / sorted.length;
+}	
 
 async function refreshLivePot() {
   const row = await fetchPersistentPotRow();
@@ -414,16 +487,145 @@ function renderSignup() {
       btn.textContent = 'Create Tag';
       return;
     }
-    profile = mapProfile(created.data);
+   profile = mapProfile(created.data);
     save('cotd_profile', profile);
     await refreshCloudData();
     render();
+    showOnboardingTutorial();
   };
+}
+
+function showOnboardingTutorial() {
+  let step = 0;
+
+  const pages = [
+    {
+      badge: 'STEP 1 OF 3 · THE MOST IMPORTANT RULE',
+      title: 'You Score Vertically!',
+      body: `
+        <p style="font-size:14px; line-height:1.5; margin:8px 0;">
+          You place cards into the grid <b>row-by-row</b> (left to right), but <b>every hand is scored VERTICALLY down each column!</b>
+        </p>
+        <ul style="margin:8px 0; padding-left:18px; line-height:1.5;">
+          <li><b>4 Vertical Hands:</b> Columns 1, 2, 3, and 4 each become a 4-card Cribbage hand stacked top-to-bottom.</li>
+          <li><b>The Crib (Column 5):</b> Every 4 cards you place, the next card goes face-down into the 5th column on the right.</li>
+          <li><b>The Cut Card:</b> Once all 16 grid slots are filled, the Cut Card flips and counts as the <b>5th card for every vertical column</b> (including the Crib).</li>
+        </ul>
+      `,
+    },
+    {
+      badge: 'STEP 2 OF 3 · POINT VALUES',
+      title: 'Cribbage Scoring',
+      body: `
+        <ul style="margin:8px 0; padding-left:18px; line-height:1.55;">
+          <li><b>15s:</b> Any combination of cards adding up to 15 = <b>2 pts</b> (Face cards = 10, Ace = 1)</li>
+          <li><b>Pairs:</b> Pair = <b>2 pts</b> · Three of a kind = <b>6 pts</b> · Four of a kind = <b>12 pts</b></li>
+          <li><b>Runs:</b> 3 or more consecutive ranks = <b>1 pt per card</b> (double runs count all combinations)</li>
+          <li><b>Flush:</b> All 4 cards in a vertical hand matching suit = <b>4 pts</b> (<b>5 pts</b> if the Cut matches too). The Crib needs all 5 cards = <b>5 pts</b></li>
+          <li><b>Nobs &amp; Heels:</b> Jack matching the Cut suit = <b>+1 pt</b> · Cut Card is a Jack = <b>+2 pts to the Crib</b></li>
+        </ul>
+      `,
+    },
+    {
+      badge: 'STEP 3 OF 3 · MODES & COINS',
+      title: 'Ways to Play',
+      body: `
+        <ul style="margin:8px 0; padding-left:18px; line-height:1.55;">
+          <li><b>Crib of the Day (1 Coin):</b> Everyone plays the exact same deck each day. Call your exact score beforehand for <b>+5 bonus Coins</b>, and score 41+ (or ≤10 in <i>Shoot the Moon</i>) to win Coins!</li>
+          <li><b>⚔️ 1v1 Arena (2 Coins):</b> Challenge another player to a <b>Best 3 of 4 hands</b> match and win Coins equal to your average score lead.</li>
+          <li><b>Free Play:</b> Unlimited practice hands anytime for 0 Coins.</li>
+        </ul>
+      `,
+    },
+  ];
+
+  const m = el(`<div class="overlay">
+    <div class="modal" style="text-align:left;">
+      <button class="modal-x" id="close-tut-top" type="button" aria-label="Close">✕</button>
+      <div class="eyebrow" id="tut-badge"></div>
+      <h2 id="tut-title" style="margin:6px 0 8px; color:#f3d27a; font-size:22px;"></h2>
+      <div id="tut-body" style="min-height:195px;"></div>
+      <div class="row" style="margin-top:14px; gap:8px;">
+        <button class="btn" id="tut-prev" type="button" style="flex:1;">← Back</button>
+        <button class="btn gold-btn" id="tut-next" type="button" style="flex:1.6;">Next →</button>
+      </div>
+    </div>
+  </div>`);
+
+  const badgeEl = m.querySelector('#tut-badge');
+  const titleEl = m.querySelector('#tut-title');
+  const bodyEl = m.querySelector('#tut-body');
+  const prevBtn = m.querySelector('#tut-prev');
+  const nextBtn = m.querySelector('#tut-next');
+
+  const closeTutorial = () => m.remove();
+
+  const renderStep = () => {
+    const p = pages[step];
+    badgeEl.textContent = p.badge;
+    titleEl.textContent = p.title;
+    bodyEl.innerHTML = p.body;
+    prevBtn.style.visibility = step === 0 ? 'hidden' : 'visible';
+    nextBtn.textContent = step === pages.length - 1 ? "Got It, Let's Play!" : 'Next →';
+  };
+
+  prevBtn.onclick = () => {
+    if (step > 0) {
+      step--;
+      renderStep();
+    }
+  };
+
+  nextBtn.onclick = () => {
+    if (step < pages.length - 1) {
+      step++;
+      renderStep();
+    } else {
+      closeTutorial();
+    }
+  };
+
+  m.querySelector('#close-tut-top').onclick = closeTutorial;
+  m.addEventListener('click', e => { if (e.target === m) closeTutorial(); });
+
+  renderStep();
+  document.body.appendChild(m);
 }
 
 function renderHome() {
   const alreadyPlayed = hasPlayedDailyToday();
   const main = root.querySelector('#main');
+
+  const myInbox = allChallenges.filter(c =>
+    c.status !== 'completed' &&
+    (c.opponent_tag === profile.tag || c.challenger_tag === profile.tag)
+  );
+  const pendingCount = myInbox.filter(c => {
+    const isChallenger = c.challenger_tag === profile.tag;
+    const myScores = isChallenger ? (c.challenger_scores || []) : (c.opponent_scores || []);
+    return myScores.length < 4;
+  }).length;
+
+  const inboxHTML = myInbox.map(c => {
+    const isChallenger = c.challenger_tag === profile.tag;
+    const rival = isChallenger ? c.opponent_tag : c.challenger_tag;
+    const myScores = isChallenger ? (c.challenger_scores || []) : (c.opponent_scores || []);
+    const theirScores = isChallenger ? (c.opponent_scores || []) : (c.challenger_scores || []);
+    const myDone = myScores.length >= 4;
+    const stake = Number(c.stake || 2);
+    const actionLabel = myDone
+      ? `Waiting (${theirScores.length}/4)`
+      : (!isChallenger && myScores.length === 0 ? `Accept & Play (${stake}🪙)` : `Play Hand ${myScores.length + 1}/4`);
+
+    return `<div class="row" style="padding:8px; border:1px solid rgba(243,210,122,.4); border-radius:8px; background:rgba(0,0,0,.25); margin:6px 0;">
+      <div style="font-size:12px;">
+        <b>vs ${escapeHTML(rival)}</b> · ${stake}🪙 Pay-In<br>
+        <span style="opacity:.85;">You: ${myScores.length}/4 · Them: ${theirScores.length}/4</span>
+      </div>
+      <button class="btn small gold-btn" data-play-1v1="${escapeHTML(c.id)}" ${myDone ? 'disabled' : ''}>${actionLabel}</button>
+    </div>`;
+  }).join('') || '<p style="font-size:12px; opacity:.8; margin:4px 0;">No active 1v1 matches right now.</p>';
+
   main.innerHTML = `<div class="felt">
     <button class="btn" id="daily" style="width:100%" ${alreadyPlayed ? 'disabled' : ''}>Crib of the Day ${alreadyPlayed ? '(done today)' : '· 1 Coin'}</button>
     <div id="daily-setup" style="display:none; margin-top:10px; padding:12px; border:1px solid #f3d27a; border-radius:10px; background:rgba(0,0,0,.35);">
@@ -435,7 +637,26 @@ function renderHome() {
       </div>
       <p class="error-text" id="prediction-error" style="margin:4px 0 0;"></p>
     </div>
-    <div class="row"><button class="btn" id="free" style="flex:1">Free Play</button><button class="btn" id="lb" style="flex:1">Boards & Stats</button></div>
+
+    <div class="row">
+      <button class="btn" id="free" style="flex:1">Free Play</button>
+      <button class="btn" id="toggle-1v1" style="flex:1">⚔️ 1v1 ${pendingCount ? `(${pendingCount})` : ''}</button>
+      <button class="btn" id="lb" style="flex:1">Boards &amp; Stats</button>
+    </div>
+
+    <div id="hub-1v1" style="display:${pendingCount ? 'block' : 'none'}; margin-top:8px; padding:12px; border:1px solid #f3d27a; border-radius:10px; background:rgba(0,0,0,.35);">
+      <div class="eyebrow">1V1 ARENA · BEST 3 OF 4 HANDS · 2 COIN PAY-IN</div>
+      <p style="margin:4px 0 8px; font-size:12px;">2 Coins to enter. Winner earns Coins equal to their Best-3-of-4 average lead (rounded down). 1 challenge per opponent per day.</p>
+      <div class="compare-search-row">
+        <input type="search" id="home-1v1-search" placeholder="Tag (ACE#1) or Initials (ACE)" autocomplete="off">
+        <button class="btn small" id="home-1v1-find" type="button">Find</button>
+      </div>
+      <div id="home-1v1-matches" style="margin-top:6px;"></div>
+      <p class="error-text" id="home-1v1-msg" style="margin:4px 0;"></p>
+      <h4 style="margin:10px 0 4px; color:#f3d27a; font-size:13px;">Your 1v1 Inbox &amp; Active Matches</h4>
+      ${inboxHTML}
+    </div>
+
     <label class="row">Auto-Fill Row 1 <input type="checkbox" id="af" ${settings.autofill ? 'checked' : ''}></label>
     <label class="row">Shoot the Moon (≤10 pts) <input type="checkbox" id="moon"></label></div>`;
 
@@ -448,6 +669,75 @@ function renderHome() {
 
   main.querySelector('#free').onclick = () => startGame('free', moonBox.checked, null);
   main.querySelector('#lb').onclick = showBoards;
+
+  const hub1v1 = main.querySelector('#hub-1v1');
+  main.querySelector('#toggle-1v1').onclick = () => {
+    hub1v1.style.display = hub1v1.style.display === 'block' ? 'none' : 'block';
+  };
+
+  const search1v1 = main.querySelector('#home-1v1-search');
+  const matches1v1 = main.querySelector('#home-1v1-matches');
+  const msg1v1 = main.querySelector('#home-1v1-msg');
+
+  main.querySelector('#home-1v1-find').onclick = async () => {
+    const term = search1v1.value.trim().toUpperCase();
+    msg1v1.textContent = '';
+    if (!term) { msg1v1.textContent = 'Enter a Player Tag or 3 initials.'; return; }
+    let q;
+    if (/^[A-Z]{3}#[0-9]+$/.test(term)) q = supabase.from('profiles').select('tag').ilike('tag', term).limit(8);
+    else if (/^[A-Z]{3}$/.test(term)) q = supabase.from('profiles').select('tag').ilike('initials', term).order('tag_number').limit(12);
+    else { msg1v1.textContent = 'Format: ACE#1 or ACE'; return; }
+    const { data } = await q;
+    const list = (data ?? []).filter(p => p.tag !== profile.tag);
+    if (!list.length) { matches1v1.innerHTML = '<p style="font-size:12px;">No matching players found.</p>'; return; }
+    matches1v1.innerHTML = `<div class="tag-options">${list.map(p => `<button class="btn small gold-btn" data-send-rival="${escapeHTML(p.tag)}">⚔️ Challenge ${escapeHTML(p.tag)} (2🪙)</button>`).join('')}</div>`;
+    matches1v1.querySelectorAll('[data-send-rival]').forEach(btn => btn.onclick = async () => {
+      const rival = btn.dataset.sendRival;
+      const alreadyToday = allChallenges.some(c =>
+        c.date_key === todayKey() &&
+        ((c.challenger_tag === profile.tag && c.opponent_tag === rival) ||
+         (c.challenger_tag === rival && c.opponent_tag === profile.tag))
+      );
+      if (alreadyToday) { msg1v1.textContent = `You already have a 1v1 with ${rival} today.`; return; }
+      if (Number(profile.coins) < 2) { msg1v1.textContent = 'You need at least 2 Coins to send a 1v1.'; return; }
+      btn.disabled = true;
+      btn.textContent = 'Sending…';
+      const { data: created, error } = await supabase.from('challenges_1v1').insert({
+        challenger_tag: profile.tag,
+        opponent_tag: rival,
+        date_key: todayKey(),
+        stake: 2,
+        scoring_rule: 'best_3_of_4',
+        status: 'pending',
+      }).select('*').single();
+      if (error || !created) {
+        msg1v1.textContent = 'Could not send challenge. Check SQL setup.';
+        btn.disabled = false;
+        return;
+      }
+      await changeCoins(-2);
+      await refreshCloudData();
+      active1v1Id = created.id;
+      startGame('1v1', false, null);
+    });
+  };
+
+  main.querySelectorAll('[data-play-1v1]').forEach(btn => btn.onclick = async () => {
+    const cid = btn.dataset.play1v1;
+    const ch = allChallenges.find(x => String(x.id) === String(cid));
+    if (!ch) return;
+    const stake = Number(ch.stake || 2);
+    const isChallenger = ch.challenger_tag === profile.tag;
+    const myScores = isChallenger ? (ch.challenger_scores || []) : (ch.opponent_scores || []);
+    if (!isChallenger && myScores.length === 0) {
+      if (Number(profile.coins) < stake) { msg1v1.textContent = `Need ${stake} Coins to accept.`; return; }
+      btn.disabled = true;
+      await changeCoins(-stake);
+      await supabase.from('challenges_1v1').update({ status: 'active' }).eq('id', ch.id);
+    }
+    active1v1Id = ch.id;
+    startGame('1v1', false, null);
+  });
 
   main.querySelector('#daily').onclick = () => {
     if (hasPlayedDailyToday()) { renderHome(); return; }
@@ -639,13 +929,69 @@ async function finishGame() {
     pot_payout: game.potPayout,
     date_key: todayKey(),
     board_snapshot: { grid: game.grid, crib: game.crib, cut: game.cut, scores: game.scores },
-  };
-  const inserted = await supabase.from('games').insert(row).select('*').single();
+  };const inserted = await supabase.from('games').insert(row).select('*').single();
   logSupabaseError('insert completed game', inserted.error);
   game.recordSaved = !inserted.error;
   game.finishing = false;
   save('cotd_game', game);
+
+  if (game.mode === '1v1' && active1v1Id) {
+    const { data: freshCh } = await supabase.from('challenges_1v1').select('*').eq('id', active1v1Id).single();
+    if (freshCh) {
+      const isChallenger = freshCh.challenger_tag === profile.tag;
+      const field = isChallenger ? 'challenger_scores' : 'opponent_scores';
+      const updatedArr = [...(freshCh[field] || []), score];
+      const patch = { [field]: updatedArr };
+
+      const cScores = isChallenger ? updatedArr : (freshCh.challenger_scores || []);
+      const oScores = isChallenger ? (freshCh.opponent_scores || []) : updatedArr;
+
+      if (cScores.length >= 4 && oScores.length >= 4 && freshCh.status !== 'completed') {
+        const cAvg = best3Of4Avg(cScores);
+        const oAvg = best3Of4Avg(oScores);
+        const stake = Number(freshCh.stake || 2);
+        const diff = Math.abs(cAvg - oAvg);
+        const marginWon = Math.floor(diff);
+        const winnerTag = marginWon <= 0 ? 'TIE' : (cAvg > oAvg ? freshCh.challenger_tag : freshCh.opponent_tag);
+
+        patch.status = 'completed';
+        patch.challenger_avg = Number(cAvg.toFixed(2));
+        patch.opponent_avg = Number(oAvg.toFixed(2));
+        patch.winner_tag = winnerTag;
+        patch.coins_won = marginWon;
+
+        if (winnerTag === 'TIE') {
+          await changeCoins(stake);
+          const rivalTag = isChallenger ? freshCh.opponent_tag : freshCh.challenger_tag;
+          const rivalProf = profiles.find(p => p.tag === rivalTag);
+          if (rivalProf) await supabase.from('profiles').update({ coins: Number(rivalProf.coins) + stake }).eq('tag', rivalTag);
+        } else if (winnerTag === profile.tag) {
+          await changeCoins(stake + marginWon);
+          const loserTag = isChallenger ? freshCh.opponent_tag : freshCh.challenger_tag;
+          const loserProf = profiles.find(p => p.tag === loserTag);
+          const extraLoss = Math.max(0, marginWon - stake);
+          if (loserProf && extraLoss > 0) {
+            await supabase.from('profiles').update({ coins: Math.max(0, Number(loserProf.coins) - extraLoss) }).eq('tag', loserTag);
+          }
+        } else {
+          const extraLoss = Math.max(0, marginWon - stake);
+          if (extraLoss > 0) await changeCoins(-Math.min(Number(profile.coins), extraLoss));
+          const winProf = profiles.find(p => p.tag === winnerTag);
+          if (winProf) await supabase.from('profiles').update({ coins: Number(winProf.coins) + stake + marginWon }).eq('tag', winnerTag);
+        }
+      }
+      await supabase.from('challenges_1v1').update(patch).eq('id', active1v1Id);
+      if (updatedArr.length >= 4) active1v1Id = null;
+    }
+  }
+
   await refreshCloudData();
+  const myRecent = allGames
+    .filter(g => g.playerTag === profile.tag && g.isMoonShot === Boolean(game.moon))
+    .slice(0, 10)
+    .reverse()
+    .map(g => g.score);
+  checkEasterEggTriggers(score, Boolean(game.moon), myRecent);
   renderBoard();
   renderHud();
 }
@@ -810,6 +1156,16 @@ async function showBoards() {
       </div>
     </div>
     <div class="pot-banner">Current Pot Value <strong>${livePot} Coins</strong></div>
+${(() => {
+      const my1v1 = allChallenges.filter(c => c.status === 'completed' && (c.challenger_tag === profile.tag || c.opponent_tag === profile.tag));
+      const wins = my1v1.filter(c => c.winner_tag === profile.tag);
+      const losses = my1v1.filter(c => c.winner_tag && c.winner_tag !== 'TIE' && c.winner_tag !== profile.tag);
+      const netCoins = wins.reduce((s, c) => s + Number(c.coins_won || 0), 0) - losses.reduce((s, c) => s + Number(c.coins_won || 0), 0);
+      return `<div class="pot-banner" style="font-size:13px;">
+        <span>⚔️ Your 1v1 Record: <b>${wins.length}W – ${losses.length}L</b></span>
+        <strong>${netCoins >= 0 ? '+' : ''}${netCoins} Coins</strong>
+      </div>`;
+    })()}
     <section class="stats-summary-card">
       <div class="pill-tabs" id="dataset-tabs">
         <button class="tab-pill active" data-ds="standard">Standard Play</button>
@@ -938,6 +1294,8 @@ async function showBoards() {
   let opponentGames = [];
   let moonCompare = false;
 
+ let compareLimit = 'all';
+
   const loadComparison = async (targetTag, shouldRender = true) => {
     const { data, error } = await supabase.from('games').select('*').eq('player_tag', targetTag).eq('is_moon_shot', moonCompare).order('created_at', { ascending: false });
     logSupabaseError(`load ${moonCompare ? 'Moon' : 'standard'} games for ${targetTag}`, error);
@@ -946,33 +1304,82 @@ async function showBoards() {
     if (shouldRender) renderComparison();
   };
 
+  const sliceByLimit = list => compareLimit === 'all' ? list : list.slice(0, Number(compareLimit));
+
+  const summarizeSimple = scores => {
+    const clean = scores.map(Number).filter(Number.isFinite);
+    if (!clean.length) return { n: 0, mean: null, high: null, low: null };
+    const mean = clean.reduce((a, b) => a + b, 0) / clean.length;
+    return {
+      n: clean.length,
+      mean,
+      high: Math.max(...clean),
+      low: Math.min(...clean),
+    };
+  };
+
+  const get1v1Summary = (tag, lim) => {
+    let list = allChallenges.filter(c => c.status === 'completed' && (c.challenger_tag === tag || c.opponent_tag === tag));
+    if (lim === '10') list = list.slice(0, 10);
+    const w = list.filter(c => c.winner_tag === tag);
+    const l = list.filter(c => c.winner_tag && c.winner_tag !== 'TIE' && c.winner_tag !== tag);
+    const net = w.reduce((s, c) => s + Number(c.coins_won || 0), 0) - l.reduce((s, c) => s + Number(c.coins_won || 0), 0);
+    return `${w.length}W–${l.length}L (${net >= 0 ? '+' : ''}${net}🪙)`;
+  };
+
   const renderComparison = () => {
     if (!selectedOpponent) { comparison.innerHTML = ''; return; }
-    const myGames = allGames.filter(g => g.playerTag === profile.tag && g.isMoonShot === moonCompare);
-    const mine = stats(myGames.map(g => g.score), moonCompare);
-    const theirs = stats(opponentGames.map(g => g.score), moonCompare);
-    const cell = (value, leads) => `<td>${leads ? '<span class="leader-tag">LEADS</span><br>' : ''}${leads ? '<b>' : ''}${value}${leads ? '</b>' : ''}</td>`;
-    const row = (label, youValue, opponentValue, youLeads, opponentLeads) => `<tr><th>${label}</th>${cell(youValue, youLeads)}${cell(opponentValue, opponentLeads)}</tr>`;
+    const myFiltered = sliceByLimit(allGames.filter(g => g.playerTag === profile.tag && g.isMoonShot === moonCompare));
+    const theirFiltered = sliceByLimit(opponentGames);
+    const mine = summarizeSimple(myFiltered.map(g => g.score));
+    const theirs = summarizeSimple(theirFiltered.map(g => g.score));
+
     const hasBoth = mine.n > 0 && theirs.n > 0;
-    const compareHigh = (you, opponent) => !hasBoth ? [false, false] : you > opponent ? [true, false] : you < opponent ? [false, true] : [false, false];
-    const compareLow = (you, opponent) => !hasBoth ? [false, false] : you < opponent ? [true, false] : you > opponent ? [false, true] : [false, false];
-    const gamesLeads = compareHigh(mine.n, theirs.n);
+    const compareHigh = (you, opp) => !hasBoth ? [false, false] : you > opp ? [true, false] : you < opp ? [false, true] : [false, false];
+    const compareLow = (you, opp) => !hasBoth ? [false, false] : you < opp ? [true, false] : you > opp ? [false, true] : [false, false];
+
     const meanLeads = moonCompare ? compareLow(mine.mean, theirs.mean) : compareHigh(mine.mean, theirs.mean);
-    const sdLeads = compareLow(mine.sd, theirs.sd);
-    const bestLeads = mine.best === null || theirs.best === null ? [false, false] : moonCompare ? compareLow(mine.best, theirs.best) : compareHigh(mine.best, theirs.best);
-    const intervalLeads = compareLow(mine.width, theirs.width);
-    const myBest = mine.best === null ? '—' : mine.best;
-    const otherBest = theirs.best === null ? '—' : theirs.best;
-    const myInterval = mine.n ? `${mine.low.toFixed(2)}–${mine.high.toFixed(2)}` : '—';
-    const otherInterval = theirs.n ? `${theirs.low.toFixed(2)}–${theirs.high.toFixed(2)}` : '—';
+    const highLeads = moonCompare ? compareLow(mine.high, theirs.high) : compareHigh(mine.high, theirs.high);
+    const lowLeads = moonCompare ? compareLow(mine.low, theirs.low) : compareHigh(mine.low, theirs.low);
+
+    const fmtHigh = val => val === null ? '—' : (!moonCompare && val >= 50 ? `${val} <span class="leader-tag">50+</span>` : val);
+    const cell = (value, leads) => `<td>${leads ? '<span class="leader-tag">LEADS</span><br>' : ''}${leads ? '<b>' : ''}${value}${leads ? '</b>' : ''}</td>`;
+    const row = (label, yVal, oVal, yLeads, oLeads) => `<tr><th>${label}</th>${cell(yVal, yLeads)}${cell(oVal, oLeads)}</tr>`;
+
     const rows = [
-      row('Games Played', mine.n, theirs.n, gamesLeads[0], gamesLeads[1]),
-      row('Average Score (x̄)', mine.n ? mine.mean.toFixed(2) : '—', theirs.n ? theirs.mean.toFixed(2) : '—', meanLeads[0], meanLeads[1]),
-      row('Sample Std Dev (s)', mine.n ? mine.sd.toFixed(2) : '—', theirs.n ? theirs.sd.toFixed(2) : '—', sdLeads[0], sdLeads[1]),
-      row('Personal Best', myBest, otherBest, bestLeads[0], bestLeads[1]),
-      row('90% Confidence Level', myInterval, otherInterval, intervalLeads[0], intervalLeads[1]),
+      row('Games Counted', mine.n, theirs.n, false, false),
+      row('Average Score', mine.mean !== null ? mine.mean.toFixed(1) : '—', theirs.mean !== null ? theirs.mean.toFixed(1) : '—', meanLeads[0], meanLeads[1]),
+      row('Highest Score', fmtHigh(mine.high), fmtHigh(theirs.high), highLeads[0], highLeads[1]),
+      row('Lowest Score', mine.low ?? '—', theirs.low ?? '—', lowLeads[0], lowLeads[1]),
     ].join('');
-    comparison.innerHTML = `<div class="head-to-head"><div class="head-to-head-title"><h3>${moonCompare ? 'Shoot the Moon' : 'Standard Play'} · Head-to-Head</h3><button class="btn small" id="clear-comparison">Clear Comparison</button></div><table class="comparison-table"><thead><tr><th>Metric</th><th>You<br>${escapeHTML(profile.tag)}</th><th>Opponent<br>${escapeHTML(selectedOpponent)}</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+
+    const scope1v1 = compareLimit === '10' ? 'Last 10' : 'All-Time';
+
+    comparison.innerHTML = `<div class="head-to-head">
+      <div class="head-to-head-title">
+        <h3>${moonCompare ? 'Shoot the Moon' : 'Standard Play'} · Head-to-Head</h3>
+        <button class="btn small" id="clear-comparison">Clear</button>
+      </div>
+      <div class="pill-tabs sub" id="compare-limit-tabs" style="margin:6px 0 8px;">
+        <button class="tab-pill ${compareLimit === 'all' ? 'active' : ''}" data-clim="all">All-Time</button>
+        <button class="tab-pill ${compareLimit === '30' ? 'active' : ''}" data-clim="30">Last 30</button>
+        <button class="tab-pill ${compareLimit === '10' ? 'active' : ''}" data-clim="10">Last 10</button>
+      </div>
+      <table class="comparison-table">
+        <thead><tr><th>Stat</th><th>You<br>${escapeHTML(profile.tag)}</th><th>Opponent<br>${escapeHTML(selectedOpponent)}</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+      <div style="display:flex; justify-content:space-between; font-size:12px; padding:6px 8px; margin-top:6px; border-radius:8px; background:rgba(0,0,0,.3);">
+        <span>⚔️ 1v1 (${scope1v1}): <b>${get1v1Summary(profile.tag, compareLimit)}</b></span>
+        <span>Them: <b>${get1v1Summary(selectedOpponent, compareLimit)}</b></span>
+      </div>
+    </div>`;
+
+    comparison.querySelectorAll('#compare-limit-tabs .tab-pill').forEach(btn => btn.onclick = () => {
+      compareLimit = btn.dataset.clim;
+      renderComparison();
+    });
+
     comparison.querySelector('#clear-comparison').onclick = () => { selectedOpponent = null; opponentGames = []; comparison.innerHTML = ''; matches.innerHTML = ''; search.value = ''; };
   };
 
