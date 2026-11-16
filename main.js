@@ -1077,6 +1077,7 @@ const inboxHTML = activeToday.map(c => {
       active1v1Id = created.id;
       startGame('1v1', isMoonBattle, null, isMoonBattle, isSabotage);
     });
+  };
 
   main.querySelectorAll('[data-play-1v1]').forEach(btn => btn.onclick = async () => {
   const cid = btn.getAttribute('data-play-1v1');
