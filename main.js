@@ -229,7 +229,18 @@ const snap = new Audio('assets/audio/card-snap.mp3');
 const load = (k, d) => JSON.parse(localStorage.getItem(k) ?? 'null') ?? d;
 const save = (k, v) => localStorage.setItem(k, JSON.stringify(v));
 const escapeHTML = value => String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-let settings = load('cotd_settings', { music: true, sfx: true, quick: false, speed: 0.55, why: false, autofill: true });
+let settings = {
+  music: true,
+  sfx: true,
+  quick: false,
+  speed: 0.55,
+  why: false,
+  autofill: true,
+  comboColors: true,
+  hiddenCrib: true,
+  freePlayMeter: true,
+  ...load('cotd_settings', {}),
+};
 let profile = null;
 let game = load('cotd_game', null);
 let allGames = [];
@@ -250,7 +261,17 @@ function logSupabaseError(action, error) {
   if (error) console.error(`[Supabase] ${action} failed:`, error);
 }
 
+function getLocalFriends(tag) {
+  if (!tag) return [];
+  const stored = load(`cotd_friends_${String(tag).toUpperCase()}`, []);
+  return Array.isArray(stored) ? stored.map(t => String(t).toUpperCase()) : [];
+}
+
 function mapProfile(row) {
+  const tag = String(row.tag || '').toUpperCase();
+  const dbFriends = Array.isArray(row.friends) ? row.friends.map(t => String(t).toUpperCase()) : [];
+  const localFriends = getLocalFriends(tag);
+  const merged = Array.from(new Set([...dbFriends, ...localFriends]));
   return {
     tag: row.tag,
     initials: row.initials,
@@ -258,8 +279,29 @@ function mapProfile(row) {
     pin: row.pin,
     deviceId: row.device_id,
     coins: Number(row.coins ?? 100),
+    friends: merged,
     createdAt: row.created_at,
   };
+}
+
+function getMyFriends() {
+  if (!profile) return [];
+  const list = Array.isArray(profile.friends) ? profile.friends : getLocalFriends(profile.tag);
+  return Array.from(new Set(list.map(t => String(t).toUpperCase())));
+}
+
+async function toggleFriend(targetTag) {
+  if (!profile) return;
+  const clean = String(targetTag || '').trim().toUpperCase();
+  if (!clean || clean === profile.tag) return;
+  const current = getMyFriends();
+  const exists = current.includes(clean);
+  const next = exists ? current.filter(t => t !== clean) : [...current, clean];
+  profile.friends = next;
+  save(`cotd_friends_${profile.tag}`, next);
+  save('cotd_profile', profile);
+  const { error } = await supabase.from('profiles').update({ friends: next }).eq('tag', profile.tag);
+  logSupabaseError('update friends list', error);
 }
 
 function mapGame(row) {
@@ -596,35 +638,38 @@ function scoreHand(hand, cut, isCrib) {
   const val = c => Math.min(c.r, 10);
   for (let m = 1; m < 1 << n; m++) {
     const idx = [...Array(n).keys()].filter(i => m & (1 << i));
-    if (idx.length > 1 && idx.reduce((a, i) => a + val(cards[i]), 0) === 15) combos.push({ pts: 2, label: '15 for 2', idx });
+    if (idx.length > 1 && idx.reduce((a, i) => a + val(cards[i]), 0) === 15) combos.push({ pts: 2, label: '15 for 2', idx, kind: '15' });
   }
   const groups = {};
   cards.forEach((c, i) => (groups[c.r] ??= []).push(i));
   for (const g of Object.values(groups)) {
-    if (g.length === 2) combos.push({ pts: 2, label: 'Pair for 2', idx: g });
-    if (g.length === 3) combos.push({ pts: 6, label: 'Trips for 6', idx: g });
-    if (g.length === 4) combos.push({ pts: 12, label: 'Quads for 12', idx: g });
+    if (g.length === 2) combos.push({ pts: 2, label: 'Pair for 2', idx: g, kind: 'pair' });
+    if (g.length === 3) combos.push({ pts: 6, label: 'Trips for 6', idx: g, kind: 'pair' });
+    if (g.length === 4) combos.push({ pts: 12, label: 'Quads for 12', idx: g, kind: 'pair' });
   }
   for (let len = n; len >= 3; len--) {
-    let found = false;
+    const runCombos = [];
     for (let m = 1; m < 1 << n; m++) {
       const idx = [...Array(n).keys()].filter(i => m & (1 << i));
       if (idx.length !== len) continue;
       const rs = idx.map(i => cards[i].r).sort((a, b) => a - b);
       if (rs.every((r, k) => k === 0 || r === rs[k - 1] + 1)) {
-        combos.push({ pts: len, label: `Run of ${len}`, idx });
-        found = true;
+        runCombos.push({ pts: len, label: `Run of ${len}`, idx });
       }
     }
-    if (found) break;
+    if (runCombos.length > 0) {
+      const runKind = runCombos.length >= 4 ? 'ddrun' : (runCombos.length >= 2 ? 'drun' : 'run');
+      runCombos.forEach(rc => combos.push({ ...rc, kind: runKind }));
+      break;
+    }
   }
   if (hand.length === 4 && hand.every(c => c.s === hand[0].s)) {
     const five = cut && cut.s === hand[0].s;
-    if (five) combos.push({ pts: 5, label: 'Flush for 5', idx: [0, 1, 2, 3, 4] });
-    else if (!isCrib) combos.push({ pts: 4, label: 'Flush for 4', idx: [0, 1, 2, 3] });
+    if (five) combos.push({ pts: 5, label: 'Flush for 5', idx: [0, 1, 2, 3, 4], kind: 'flush' });
+    else if (!isCrib) combos.push({ pts: 4, label: 'Flush for 4', idx: [0, 1, 2, 3], kind: 'flush' });
   }
   if (cut) hand.forEach((c, i) => {
-    if (c.r === 11 && c.s === cut.s) combos.push({ pts: 1, label: 'His Nobs for 1', idx: [i] });
+    if (c.r === 11 && c.s === cut.s) combos.push({ pts: 1, label: 'His Nobs for 1', idx: [i], kind: 'nobs' });
   });
   return combos;
 }
@@ -968,6 +1013,18 @@ const inboxHTML = activeToday.map(c => {
       </ul>
       </div>
       <p style="margin:4px 0 8px; font-size:12px;">Challenge each rival up to once in <b>Regular</b>, <b>Moon</b>, and <b>Sabotage</b> per day (2🪙 each). Matches reset at midnight—unfinished games forfeit with a full 2-Coin refund.</p>
+      <div class="friends-bar" id="home-friends-bar">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <span style="font-size:11px; font-weight:800; color:#f3d27a; letter-spacing:.4px;">⭐ YOUR FRIENDS (TAP TO CHALLENGE)</span>
+          <span style="font-size:11px; opacity:.75;">${getMyFriends().length} saved</span>
+        </div>
+        <div class="friend-pill-row" id="home-friends-pills">
+        ${getMyFriends().length
+          ? getMyFriends().map(f => `<span class="friend-chip" data-pick-friend="${escapeHTML(f)}">⭐ ${escapeHTML(f)} <b data-unfriend="${escapeHTML(f)}" title="Unfriend ${escapeHTML(f)}" style="margin-left:4px; padding:0 4px; border-radius:999px; background:rgba(0,0,0,.25); color:#ff8b8b;">✕</b></span>`).join('')
+          : '<span style="font-size:11px; opacity:.75;">Search a player below and tap + Friend to pin them here.</span>'}
+      </div>
+        <div id="home-friend-actions" style="margin-top:6px;"></div>
+      </div>
       <div class="compare-search-row">
         <input type="search" id="home-1v1-search" placeholder="Tag (ACE#1) or Initials (ACE)" autocomplete="off">
         <button class="btn small" id="home-1v1-find" type="button">Find</button>
@@ -1010,32 +1067,48 @@ const inboxHTML = activeToday.map(c => {
     sabHelpBar.style.display = sabHelpBar.style.display === 'block' ? 'none' : 'block';
   };
 
-  const search1v1 = main.querySelector('#home-1v1-search');
+const search1v1 = main.querySelector('#home-1v1-search');
   const matches1v1 = main.querySelector('#home-1v1-matches');
   const msg1v1 = main.querySelector('#home-1v1-msg');
+  const friendActions = main.querySelector('#home-friend-actions');
 
-  main.querySelector('#home-1v1-find').onclick = async () => {
-    const term = search1v1.value.trim().toUpperCase();
-    msg1v1.textContent = '';
-    if (!term) { msg1v1.textContent = 'Enter a Player Tag or 3 initials.'; return; }
-    let q;
-    if (/^[A-Z]{3}#[0-9]+$/.test(term)) q = supabase.from('profiles').select('tag').ilike('tag', term).limit(8);
-    else if (/^[A-Z]{3}$/.test(term)) q = supabase.from('profiles').select('tag').ilike('initials', term).order('tag_number').limit(12);
-    else { msg1v1.textContent = 'Format: ACE#1 or ACE'; return; }
-    const { data } = await q;
-    const list = (data ?? []).filter(p => p.tag !== profile.tag);
-    if (!list.length) { matches1v1.innerHTML = '<p style="font-size:12px;">No matching players found.</p>'; return; }
-    matches1v1.innerHTML = list.map(p => `
-      <div class="row" style="padding:6px 8px; margin:4px 0; border-radius:8px; background:rgba(255,255,255,.06); gap:6px; flex-wrap:wrap;">
-        <b style="font-size:13px;">${escapeHTML(p.tag)}</b>
-        <div style="display:flex; gap:5px; flex-wrap:wrap;">
-          <button class="btn small gold-btn" data-send-rival="${escapeHTML(p.tag)}" data-send-type="regular">⚔️ Regular (2🪙)</button>
-          <button class="btn small" data-send-rival="${escapeHTML(p.tag)}" data-send-type="moon">🌙 Moon (2🪙)</button>
-          <button class="btn small" data-send-rival="${escapeHTML(p.tag)}" data-send-type="sabotage">🔥 Sabotage (2🪙)</button>
-        </div>
-      </div>`).join('');
+  const hasPlayedRuleTodayWith = (rival, ruleKey) => allChallenges.some(c => {
+    if (c.date_key !== todayKey() || c.status === 'expired') return false;
+    const samePair = (c.challenger_tag === profile.tag && c.opponent_tag === rival)
+      || (c.challenger_tag === rival && c.opponent_tag === profile.tag);
+    if (!samePair) return false;
+    const cRule = c.scoring_rule || (c.is_moon_battle ? 'moon_best_3_of_4' : 'best_3_of_4');
+    return cRule === ruleKey;
+  });
 
-    matches1v1.querySelectorAll('[data-send-rival]').forEach(btn => btn.onclick = async () => {
+  const renderRivalChallengeCard = (tag, showRemoveFriend = false) => {
+    const regDone = hasPlayedRuleTodayWith(tag, 'best_3_of_4');
+    const moonDone = hasPlayedRuleTodayWith(tag, 'moon_best_3_of_4');
+    const sabDone = hasPlayedRuleTodayWith(tag, 'sabotage_4');
+    const isFriend = getMyFriends().includes(tag);
+    return `<div class="row" style="padding:6px 8px; margin:4px 0; border-radius:8px; background:rgba(255,255,255,.06); gap:6px; flex-wrap:wrap;">
+      <div style="display:flex; align-items:center; gap:6px;">
+        <b style="font-size:13px;">${escapeHTML(tag)}</b>
+        <button type="button" class="btn small" data-toggle-friend="${escapeHTML(tag)}" style="padding:2px 6px; font-size:11px;">${showRemoveFriend ? '✕ Remove' : (isFriend ? '★ Friend' : '+ Friend')}</button>
+      </div>
+      <div style="display:flex; gap:5px; flex-wrap:wrap;">
+        <button class="btn small gold-btn" data-send-rival="${escapeHTML(tag)}" data-send-type="regular" ${regDone ? 'disabled' : ''}>⚔️ Regular ${regDone ? '(Done)' : '(2🪙)'}</button>
+        <button class="btn small" data-send-rival="${escapeHTML(tag)}" data-send-type="moon" ${moonDone ? 'disabled' : ''}>🌙 Moon ${moonDone ? '(Done)' : '(2🪙)'}</button>
+        <button class="btn small" data-send-rival="${escapeHTML(tag)}" data-send-type="sabotage" ${sabDone ? 'disabled' : ''}>🔥 Sabotage ${sabDone ? '(Done)' : '(2🪙)'}</button>
+      </div>
+    </div>`;
+  };
+
+  const bindChallengeContainer = container => {
+    container.querySelectorAll('[data-toggle-friend]').forEach(btn => btn.onclick = async () => {
+      const tag = btn.getAttribute('data-toggle-friend');
+      await toggleFriend(tag);
+      renderHome();
+      const reopened = root.querySelector('#hub-1v1');
+      if (reopened) reopened.style.display = 'block';
+    });
+
+    container.querySelectorAll('[data-send-rival]').forEach(btn => btn.onclick = async () => {
       const rival = btn.getAttribute('data-send-rival');
       const sendType = btn.getAttribute('data-send-type');
       const isMoonBattle = sendType === 'moon';
@@ -1043,15 +1116,7 @@ const inboxHTML = activeToday.map(c => {
       const ruleKey = isSabotage ? 'sabotage_4' : (isMoonBattle ? 'moon_best_3_of_4' : 'best_3_of_4');
       const modeLabel = isSabotage ? 'Sabotage' : (isMoonBattle ? 'Shoot the Moon' : 'Regular');
 
-      const alreadyToday = allChallenges.some(c => {
-        if (c.date_key !== todayKey() || c.status === 'expired') return false;
-        const samePair = (c.challenger_tag === profile.tag && c.opponent_tag === rival)
-          || (c.challenger_tag === rival && c.opponent_tag === profile.tag);
-        if (!samePair) return false;
-        const cRule = c.scoring_rule || (c.is_moon_battle ? 'moon_best_3_of_4' : 'best_3_of_4');
-        return cRule === ruleKey;
-      });
-      if (alreadyToday) { msg1v1.textContent = `You already have a ${modeLabel} 1v1 with ${rival} today.`; return; }
+      if (hasPlayedRuleTodayWith(rival, ruleKey)) { msg1v1.textContent = `You already have a ${modeLabel} 1v1 with ${rival} today.`; return; }
       if (Number(profile.coins) < 2) { msg1v1.textContent = 'You need at least 2 Coins to send a 1v1.'; return; }
       btn.disabled = true;
       const prevText = btn.textContent;
@@ -1070,7 +1135,7 @@ const inboxHTML = activeToday.map(c => {
       }).select('*').single();
       if (error || !created) {
         logSupabaseError('create 1v1 challenge', error);
-        msg1v1.textContent = `Could not send challenge: ${error?.message || 'Run the sabotage_state SQL update first.'}`;
+        msg1v1.textContent = `Could not send challenge: ${error?.message || 'Error creating match.'}`;
         btn.disabled = false;
         btn.textContent = prevText;
         return;
@@ -1080,6 +1145,43 @@ const inboxHTML = activeToday.map(c => {
       active1v1Id = created.id;
       startGame('1v1', isMoonBattle, null, isMoonBattle, isSabotage);
     });
+  };
+
+  main.querySelectorAll('[data-unfriend]').forEach(xBtn => xBtn.onclick = async e => {
+    e.stopPropagation();
+    const fTag = xBtn.getAttribute('data-unfriend');
+    await toggleFriend(fTag);
+    renderHome();
+    const reopened = root.querySelector('#hub-1v1');
+    if (reopened) reopened.style.display = 'block';
+  });
+
+  let selectedHomeFriend = null;
+  main.querySelectorAll('[data-pick-friend]').forEach(chip => chip.onclick = () => {
+    const fTag = chip.getAttribute('data-pick-friend');
+    selectedHomeFriend = selectedHomeFriend === fTag ? null : fTag;
+    main.querySelectorAll('[data-pick-friend]').forEach(c => c.classList.toggle('active', c.getAttribute('data-pick-friend') === selectedHomeFriend));
+    if (!selectedHomeFriend) {
+      friendActions.innerHTML = '';
+    } else {
+      friendActions.innerHTML = renderRivalChallengeCard(selectedHomeFriend, true);
+      bindChallengeContainer(friendActions);
+    }
+  });
+
+  main.querySelector('#home-1v1-find').onclick = async () => {
+    const term = search1v1.value.trim().toUpperCase();
+    msg1v1.textContent = '';
+    if (!term) { msg1v1.textContent = 'Enter a Player Tag or 3 initials.'; return; }
+    let q;
+    if (/^[A-Z]{3}#[0-9]+$/.test(term)) q = supabase.from('profiles').select('tag').ilike('tag', term).limit(8);
+    else if (/^[A-Z]{3}$/.test(term)) q = supabase.from('profiles').select('tag').ilike('initials', term).order('tag_number').limit(12);
+    else { msg1v1.textContent = 'Format: ACE#1 or ACE'; return; }
+    const { data } = await q;
+    const list = (data ?? []).filter(p => p.tag !== profile.tag);
+    if (!list.length) { matches1v1.innerHTML = '<p style="font-size:12px;">No matching players found.</p>'; return; }
+    matches1v1.innerHTML = list.map(p => renderRivalChallengeCard(p.tag, false)).join('');
+    bindChallengeContainer(matches1v1);
   };
 
   main.querySelectorAll('[data-play-1v1]').forEach(btn => btn.onclick = async () => {
@@ -1328,19 +1430,118 @@ function getLive1v1BoxHTML() {
   </div>`;
 }
 
+function getSabotageDamageReportHTML() {
+  if (!game || game.mode !== '1v1' || game.dismissedDamageReport) return '';
+  const chId = game.challengeId || active1v1Id;
+  const ch = allChallenges.find(x => String(x.id) === String(chId));
+  if (!ch || !isSabotageMatch(ch)) return '';
+  const isChallenger = String(ch.challenger_tag).toUpperCase() === profile.tag;
+  const myScores = Array.isArray(isChallenger ? ch.challenger_scores : ch.opponent_scores)
+    ? (isChallenger ? ch.challenger_scores : ch.opponent_scores) : [];
+  const roundCompleted = myScores.length;
+  if (roundCompleted < 1 || roundCompleted > 3) return '';
+
+  const sab = ch.sabotage_state || defaultSabotageState();
+  const myBurned = isChallenger ? (sab.cBurned || []) : (sab.oBurned || []);
+  const myKnown = isChallenger ? (sab.cKnown || []) : (sab.oKnown || []);
+  const mySaved = isChallenger ? (sab.cSavedLast || []) : (sab.oSavedLast || []);
+  const cfg = SABOTAGE_ROUNDS[roundCompleted];
+  const hiddenTotal = Math.max(0, myBurned.length - myKnown.length);
+
+  return `<div class="damage-report-banner" id="sab-damage-report">
+    <div class="damage-report-head">
+      <span>🔥 ROUND ${roundCompleted} SABOTAGE REPORT</span>
+      <button type="button" class="btn small" id="dismiss-damage-report" style="padding:1px 7px; font-size:11px;">✕</button>
+    </div>
+    <div>
+      Rival launched <b>${cfg.burn}</b> burns: <b>${myBurned.length}</b> total cards permanently gone from your deck
+      (${myKnown.length} exposed, <b>${hiddenTotal}</b> hidden in fog of war).
+    </div>
+    <div style="margin-top:3px; color:${mySaved.length ? '#7ee787' : '#ffbe76'};">
+      ${mySaved.length
+        ? `🛡️ <b>Your Shield blocked ${mySaved.length}:</b> ${mySaved.map(formatCardText).join(', ')} stayed in your deck!`
+        : '🛡️ Your Secret Shield did not intercept any burns last round.'}
+    </div>
+  </div>`;
+}
+
+function showVerticalMeter() {
+  if (!game) return false;
+  if (game.mode === 'daily') return true;
+  if (game.mode === 'free') return Boolean(settings.freePlayMeter);
+  return false;
+}
+
+function getMeterZoneInfo(pts, isMoon) {
+  if (isMoon) {
+    return pts <= 10
+      ? { label: 'MOON!', color: '#fde047' }
+      : { label: 'BUST', color: '#fb7185' };
+  }
+  if (pts <= 10) return { label: '0-10', color: '#fbbf24' };
+  if (pts <= 20) return { label: '−5🪙', color: '#fb7185' };
+  if (pts <= 30) return { label: 'LOW', color: '#fb923c' };
+  if (pts <= 40) return { label: 'EVEN', color: '#cbd5e1' };
+  if (pts <= 45) return { label: '+1🪙', color: '#34d399' };
+  if (pts <= 50) return { label: '+5🪙', color: '#38bdf8' };
+  return { label: 'POT!', color: '#fef08a' };
+}
+
+function updateVerticalMeterDOM() {
+  const wrap = root.querySelector('#tier-meter-wrap');
+  if (!wrap || !game) return;
+  const pts = game.scores.reduce((a, b) => a + b, 0);
+  const pct = Math.max(2, Math.min(98, (Math.min(60, pts) / 60) * 100));
+  const zone = getMeterZoneInfo(pts, Boolean(game.moon));
+  const valEl = wrap.querySelector('#tier-meter-val');
+  const needleEl = wrap.querySelector('#tier-meter-needle');
+  const zoneEl = wrap.querySelector('#tier-meter-zone');
+  if (valEl) valEl.textContent = pts;
+  if (needleEl) needleEl.style.bottom = `${pct}%`;
+  if (zoneEl) {
+    zoneEl.textContent = zone.label;
+    zoneEl.style.color = zone.color;
+  }
+}
+
+function getVerticalMeterHTML() {
+  if (!showVerticalMeter()) return '';
+  const pts = game.scores.reduce((a, b) => a + b, 0);
+  const pct = Math.max(2, Math.min(98, (Math.min(60, pts) / 60) * 100));
+  const zone = getMeterZoneInfo(pts, Boolean(game.moon));
+  const predMarker = game.mode === 'daily' && Number.isInteger(game.predictedScore)
+    ? `<div class="tier-meter-pred" style="bottom:${Math.max(2, Math.min(98, (Math.min(60, game.predictedScore) / 60) * 100))}%" title="Your Prediction: ${game.predictedScore} pts"></div>`
+    : '';
+  return `<div class="tier-meter-wrap" id="tier-meter-wrap" title="Live Score & Payout Tier Meter">
+    <div class="tier-meter-val" id="tier-meter-val">${pts}</div>
+    <div class="tier-meter-track">
+      ${predMarker}
+      <div class="tier-meter-needle" id="tier-meter-needle" style="bottom:${pct}%"></div>
+    </div>
+    <div class="tier-meter-zone" id="tier-meter-zone" style="color:${zone.color}">${zone.label}</div>
+  </div>`;
+}
+
 function renderBoard() {
   const main = root.querySelector('#main');
   if (!main) return;
   const n = placed();
   const moonLocked = game.isSabotage1v1 || game.moon || n >= 8;
+  const hideCribCards = !game.cut || (settings.hiddenCrib && !game.cribRevealed && !game.done);
   main.innerHTML = `<div class="felt"><div class="trays">
       <div class="tray"><div class="lbl">NEXT CARD</div><div class="slot" id="next"></div></div>
       <div class="tray cut"><div class="lbl">CUT CARD</div><div class="slot" id="cut"></div></div></div>
     ${getLive1v1BoxHTML()}
+    ${getSabotageDamageReportHTML()}
     <label class="row">🌙 Shoot the Moon ${game.moon ? '(ON)' : ''} <input type="checkbox" id="moon" ${game.moon ? 'checked' : ''} ${moonLocked ? 'disabled' : ''}></label>
-    <div class="grid" id="grid"></div>
+    <div class="board-with-meter">
+      <div class="grid" id="grid"></div>
+      ${getVerticalMeterHTML()}
+    </div>
     <div class="scores">${['Hand 1', 'Hand 2', 'Hand 3', 'Hand 4', 'Crib'].map((l, i) => `<div class="sc">${l}<b id="sc${i}">${game.scores[i]}</b></div>`).join('')}</div>
     </div><div id="result"></div>`;
+  const dismissBtn = main.querySelector('#dismiss-damage-report');
+  if (dismissBtn) dismissBtn.onclick = () => { game.dismissedDamageReport = true; save('cotd_game', game); renderBoard(); };
   main.querySelector('#moon').onchange = e => { if (e.target.checked) { game.moon = true; save('cotd_game', game); renderBoard(); renderHud(); } };
   const grid = main.querySelector('#grid');
   for (let r = 0; r < 4; r++) {
@@ -1354,7 +1555,7 @@ function renderBoard() {
           cell.onclick = () => placeCard(r * 4 + c);
         }
       } else if (game.crib[r]) {
-        cell.innerHTML = cardHTML(game.crib[r], !game.cut);
+        cell.innerHTML = cardHTML(game.crib[r], hideCribCards);
       }
       grid.appendChild(cell);
     }
@@ -1371,7 +1572,21 @@ function liveScores() {
   }
 }
 
+const COMBO_HL_CLASS = {
+  pair: 'hl-pair',
+  run: 'hl-run',
+  drun: 'hl-drun',
+  ddrun: 'hl-ddrun',
+  '15': 'hl-15',
+  nobs: 'hl-nobs',
+  flush: 'hl-flush',
+};
+
 function placeCard(i) {
+  const col = i % 4;
+  const prevCombos = scoreHand([0, 1, 2, 3].map(r => game.grid[r * 4 + col]).filter(Boolean), null, false);
+  const prevSigs = new Set(prevCombos.map(cb => `${cb.kind}:${cb.idx.join(',')}`));
+
   game.grid[i] = game.deck.shift();
   if (settings.sfx) { snap.currentTime = 0; snap.play().catch(() => {}); }
   const n = placed();
@@ -1381,6 +1596,24 @@ function placeCard(i) {
   renderBoard();
   renderHud();
   root.querySelector('#next')?.classList.add('pulse');
+
+  if (settings.comboColors) {
+    const filledRows = [0, 1, 2, 3].filter(r => Boolean(game.grid[r * 4 + col]));
+    const nowCombos = scoreHand(filledRows.map(r => game.grid[r * 4 + col]), null, false);
+    const newCombos = nowCombos.filter(cb => !prevSigs.has(`${cb.kind}:${cb.idx.join(',')}`));
+    newCombos.forEach(cb => {
+      const cls = COMBO_HL_CLASS[cb.kind] || 'hl';
+      cb.idx.forEach(localIdx => {
+        const actualRow = filledRows[localIdx];
+        const cardEl = root.querySelector(`.cell[data-r="${actualRow}"][data-c="${col}"] .card`);
+        if (cardEl) {
+          cardEl.classList.add(cls);
+          setTimeout(() => cardEl.classList.remove(cls), 217.7);
+        }
+      });
+    });
+  }
+
   if (n === 16) setTimeout(revealCut, 400);
 }
 
@@ -1388,23 +1621,45 @@ const sleep = s => new Promise(resolve => setTimeout(resolve, s * 1000));
 
 async function revealCut() {
   if (!game || game.done || !game.cut && placed() !== 16) return;
+  const deferCrib = Boolean(settings.hiddenCrib) && !settings.quick;
   if (!game.cut) {
     game.cut = game.deck.shift();
-    game.scores = [0, 0, 0, 0, game.cut.r === 11 ? 2 : 0];
+    game.cribRevealed = !deferCrib;
+    game.scores = [0, 0, 0, 0, (!deferCrib && game.cut.r === 11) ? 2 : 0];
     save('cotd_game', game);
     renderBoard();
   }
   const hands = [0, 1, 2, 3].map(c => [0, 1, 2, 3].map(r => game.grid[r * 4 + c]));
   hands.push(game.crib);
   for (let c = 0; c < 5; c++) {
+    if (c === 4 && deferCrib && !game.cribRevealed) {
+      await sleep(0.65);
+      for (let r = 0; r < 4; r++) {
+        const cribCell = root.querySelector(`.cell[data-r="${r}"][data-c="4"]`);
+        if (cribCell && game.crib[r]) {
+          cribCell.innerHTML = cardHTML(game.crib[r], false);
+          cribCell.querySelector('.card')?.classList.add('crib-flip');
+          if (settings.sfx) { snap.currentTime = 0; snap.play().catch(() => {}); }
+          await sleep(Math.max(0.48, settings.speed * 0.95));
+        }
+      }
+      await sleep(0.35);
+      game.cribRevealed = true;
+      save('cotd_game', game);
+      if (game.cut.r === 11) {
+        game.scores[4] += 2;
+        await flash([], 4, { pts: 2, label: 'His Heels for 2', kind: 'nobs' });
+      }
+    }
     const combos = scoreHand(hands[c], game.cut, c === 4);
     if (settings.quick) { game.scores[c] += total(combos); continue; }
-    if (c === 4 && game.cut.r === 11) await flash([], c, { pts: 2, label: 'His Heels for 2' });
+    if (c === 4 && !deferCrib && game.cut.r === 11) await flash([], c, { pts: 2, label: 'His Heels for 2', kind: 'nobs' });
     for (const combo of combos) {
       game.scores[c] += combo.pts;
       await flash(combo.idx, c, combo);
     }
   }
+  game.cribRevealed = true;
   game.done = true;
   game.finalTotalScore = game.scores.reduce((a, b) => a + b, 0);
   save('cotd_game', game);
@@ -1414,7 +1669,8 @@ async function revealCut() {
 async function flash(idx, col, combo) {
   const nodes = idx.map(i => i === 4 ? root.querySelector('#cut .card') : root.querySelector(`.cell[data-r="${i}"][data-c="${col}"] .card`)).filter(Boolean);
   if (!nodes.length) nodes.push(root.querySelector('#cut .card'));
-  nodes.forEach(n => n?.classList.add('hl'));
+  const hlClass = settings.comboColors ? (COMBO_HL_CLASS[combo.kind] || 'hl') : 'hl';
+  nodes.forEach(n => n?.classList.add(hlClass));
   const first = nodes.find(Boolean);
   if (!first) return;
   const runningTotal = game.scores.reduce((a, b) => a + b, 0);
@@ -1426,11 +1682,12 @@ async function flash(idx, col, combo) {
     scoreBox.textContent = game.scores[col];
     scoreBox.classList.remove('pulse'); void scoreBox.offsetWidth; scoreBox.classList.add('pulse');
   }
+  updateVerticalMeterDOM();
   const live1v1El = root.querySelector('#live-1v1-box');
   if (live1v1El) live1v1El.outerHTML = getLive1v1BoxHTML();
   await sleep(settings.speed);
   badge.remove();
-  nodes.forEach(n => n?.classList.remove('hl'));
+  nodes.forEach(n => n?.classList.remove(hlClass));
 }
 
 async function finishGame() {
@@ -1833,20 +2090,27 @@ function showSettings() {
   const m = modal(`<h3>Settings</h3>
     <label class="row">Background Music <input type="checkbox" data-k="music" ${settings.music ? 'checked' : ''}></label>
     <label class="row">Card Sound Effects <input type="checkbox" data-k="sfx" ${settings.sfx ? 'checked' : ''}></label>
+    <label class="row">Card Combo Glow <input type="checkbox" data-k="comboColors" ${settings.comboColors ? 'checked' : ''}></label>
+    <label class="row">Hidden Crib (Dramatic Flip) <input type="checkbox" data-k="hiddenCrib" ${settings.hiddenCrib ? 'checked' : ''}></label>
+    <label class="row">Free Play Payout Meter <input type="checkbox" data-k="freePlayMeter" ${settings.freePlayMeter ? 'checked' : ''}></label>
     <label class="row">Quick Play <input type="checkbox" data-k="quick" ${settings.quick ? 'checked' : ''}></label>
     <label class="row">Show Why Points Scored <input type="checkbox" data-k="why" ${settings.why ? 'checked' : ''}></label>
-    <label class="row">Scoring Animation Speed <span id="spv">${settings.speed}s</span>
-    <input type="range" min="0.25" max="1.2" step="0.05" value="${settings.speed}" id="sp" style="width:100%"></label>`);
+    <label class="row">Scoring Animation Speed <span id="spv">${Number(settings.speed).toFixed(2)}s</span>
+    <input type="range" min="0.10" max="1.00" step="0.05" value="${settings.speed}" id="sp" style="width:100%"></label>`);
   m.querySelectorAll('[data-k]').forEach(input => input.onchange = () => {
     settings[input.dataset.k] = input.checked;
     save('cotd_settings', settings);
     if (settings.music) ensureMusicPlaying(); else music.pause();
+    if (game && input.dataset.k === 'freePlayMeter') renderBoard();
   });
-  m.querySelector('#sp').oninput = e => {
-    settings.speed = +e.target.value;
-    m.querySelector('#spv').textContent = settings.speed + 's';
-    save('cotd_settings', settings);
-  };
+  const spSlider = m.querySelector('#sp');
+  if (spSlider) {
+    spSlider.oninput = e => {
+      settings.speed = Number(e.target.value);
+      m.querySelector('#spv').textContent = settings.speed.toFixed(2) + 's';
+      save('cotd_settings', settings);
+    };
+  }
 }
 
 function showRules() {
@@ -1936,7 +2200,15 @@ function phi(z) {
 }
 
 function gameRows(list, extra) {
-  return `<table><tbody>${list.map((g, i) => `<tr><td>${i + 1}</td><td>${escapeHTML(g.playerTag)}</td><td>${Number(g.score)}</td><td>${extra ? extra(g) : ''}</td></tr>`).join('') || '<tr><td colspan="4">No saved games yet</td></tr>'}</tbody></table>`;
+  return `<table><tbody>${list.map((g, i) => {
+    const hasBoard = Boolean(g.boardSnapshot);
+    return `<tr class="${hasBoard ? 'clickable-row' : ''}" ${hasBoard ? `data-view-game="${escapeHTML(g.id)}" title="Tap to view hand"` : ''}>
+      <td>${i + 1}</td>
+      <td>${escapeHTML(g.playerTag)}</td>
+      <td><b>${Number(g.score)}</b>${hasBoard ? ' 👁️' : ''}</td>
+      <td>${extra ? extra(g) : ''}</td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="4">No saved games yet</td></tr>'}</tbody></table>`;
 }
 
 async function showBoards() {
@@ -2009,6 +2281,24 @@ ${(() => {
       </div>
       <div class="history-scroll" id="personal-history-table"></div>
     </section>
+    <section class="stats-summary-card" style="margin-top:8px;">
+      <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:6px;">
+        <h3 style="margin:0;">⭐ Friends Circle &amp; Group Stats</h3>
+        <div class="pill-tabs sub" id="friends-ds-tabs" style="margin:0;">
+          <button class="tab-pill active" data-fds="standard">Standard</button>
+          <button class="tab-pill" data-fds="moon">Moon</button>
+        </div>
+      </div>
+      <div class="pill-tabs sub" id="friends-lim-tabs" style="margin:6px 0;">
+        <button class="tab-pill active" data-flim="all">All-Time</button>
+        <button class="tab-pill" data-flim="100">Last 100</button>
+        <button class="tab-pill" data-flim="30">Last 30</button>
+        <button class="tab-pill" data-flim="10">Last 10</button>
+      </div>
+      <div id="friends-group-stats"></div>
+      <div style="font-size:11px; opacity:.8; margin-top:6px;">Tap any friend below to view their individual Head-to-Head stats:</div>
+      <div class="friend-pill-row" id="boards-friend-pills"></div>
+    </section>
     <section class="compare-search"><h3>Compare Against Another Player</h3><div class="compare-search-row"><input type="search" id="tag-search" placeholder="Player tag (ACE#1) or initials (ACE)" autocomplete="off"><button class="btn" id="tag-search-btn">Search</button></div>
       <label class="moon-compare-toggle"><input type="checkbox" id="compare-moon"> Compare Shooting the Moon stats</label>
       <div id="compare-matches" aria-live="polite"></div><div id="comparison-card"></div>
@@ -2062,14 +2352,20 @@ ${(() => {
       ? myGames.filter(g => (isMoon ? g.score <= 10 : g.coinsDelta > 0 || g.potPayout > 0))
       : myGames;
 
-    m.querySelector('#personal-history-table').innerHTML = `<table>
+    const histBox = m.querySelector('#personal-history-table');
+    histBox.innerHTML = `<table>
       <thead><tr><th>#</th><th>Score</th><th>Mode</th><th>Coins</th><th>Date</th></tr></thead>
       <tbody>${visibleHistory.map((g, idx) => {
         const modeLabel = g.isMoonShot ? 'MOON' : (g.mode === 'daily' ? 'DAILY' : 'FREE');
         const deltaStr = g.coinsDelta ? `${g.coinsDelta > 0 ? '+' : ''}${g.coinsDelta}` : '0';
-        return `<tr><td>${idx + 1}</td><td><b>${g.score}</b></td><td>${modeLabel}</td><td>${deltaStr}</td><td>${escapeHTML(g.dateKey)}</td></tr>`;
+        const hasBoard = Boolean(g.boardSnapshot);
+        return `<tr class="${hasBoard ? 'clickable-row' : ''}" ${hasBoard ? `data-hist-game="${escapeHTML(g.id)}" title="Tap to view hand"` : ''}><td>${idx + 1}</td><td><b>${g.score}</b>${hasBoard ? ' 👁️' : ''}</td><td>${modeLabel}</td><td>${deltaStr}</td><td>${escapeHTML(g.dateKey)}</td></tr>`;
       }).join('') || `<tr><td colspan="5">${winsOnly ? 'No winning rounds in this filter yet' : 'No completed games yet'}</td></tr>`}</tbody>
     </table>`;
+    histBox.querySelectorAll('[data-hist-game]').forEach(tr => tr.onclick = () => {
+      const found = allGames.find(g => String(g.id) === tr.getAttribute('data-hist-game'));
+      if (found) viewHand(found);
+    });
   };
 
   m.querySelectorAll('#dataset-tabs .tab-pill').forEach(btn => btn.onclick = () => {
@@ -2103,6 +2399,85 @@ ${(() => {
   };
 
  renderPersonalStats();
+
+  let friendsDs = 'standard';
+  let friendsLim = 'all';
+
+  const renderFriendsSection = () => {
+    const groupBox = m.querySelector('#friends-group-stats');
+    const pillsBox = m.querySelector('#boards-friend-pills');
+    if (!groupBox || !pillsBox) return;
+    const friendTags = getMyFriends();
+    const circleTags = new Set([profile.tag, ...friendTags]);
+    const isMoon = friendsDs === 'moon';
+
+    let pooled = allGames.filter(g => circleTags.has(g.playerTag) && g.isMoonShot === isMoon);
+    if (friendsLim !== 'all') pooled = pooled.slice(0, Number(friendsLim));
+    const scores = pooled.map(g => g.score);
+
+    if (!scores.length) {
+      groupBox.innerHTML = `<p style="font-size:12px; opacity:.8; margin:4px 0;">No ${isMoon ? 'Moon' : 'Standard'} games recorded for your Friends Circle yet.</p>`;
+    } else {
+      const high = Math.max(...scores);
+      const low = Math.min(...scores);
+      const avg = scores.reduce((a, b) => a + b, 0) / scores.length;
+      groupBox.innerHTML = `<div style="display:grid; grid-template-columns:repeat(4, 1fr); gap:6px; text-align:center; margin:6px 0;">
+        <div style="padding:6px; border-radius:8px; background:rgba(0,0,0,.3);">
+          <div style="font-size:10px; opacity:.75;">GAMES</div><b>${scores.length}</b>
+        </div>
+        <div style="padding:6px; border-radius:8px; background:rgba(0,0,0,.3);">
+          <div style="font-size:10px; opacity:.75;">AVERAGE</div><b style="color:#f3d27a;">${avg.toFixed(1)}</b>
+        </div>
+        <div style="padding:6px; border-radius:8px; background:rgba(0,0,0,.3);">
+          <div style="font-size:10px; opacity:.75;">HIGH</div><b style="color:#7ee787;">${high}</b>
+        </div>
+        <div style="padding:6px; border-radius:8px; background:rgba(0,0,0,.3);">
+          <div style="font-size:10px; opacity:.75;">LOW</div><b style="color:#ff8b8b;">${low}</b>
+        </div>
+      </div>`;
+    }
+
+    if (!friendTags.length) {
+      pillsBox.innerHTML = '<span style="font-size:12px; opacity:.75;">No friends added yet—add friends in the ⚔️ 1v1 Arena or search below.</span>';
+    } else {
+      pillsBox.innerHTML = friendTags.map(f => `<span class="friend-chip ${selectedOpponent === f ? 'active' : ''}" data-board-friend="${escapeHTML(f)}">⭐ ${escapeHTML(f)} <b data-board-unfriend="${escapeHTML(f)}" title="Unfriend ${escapeHTML(f)}" style="margin-left:4px; padding:0 4px; border-radius:999px; background:rgba(0,0,0,.25); color:#ff8b8b;">✕</b></span>`).join('');
+      pillsBox.querySelectorAll('[data-board-unfriend]').forEach(xBtn => xBtn.onclick = async e => {
+        e.stopPropagation();
+        const fTag = xBtn.getAttribute('data-board-unfriend');
+        await toggleFriend(fTag);
+        if (selectedOpponent === fTag) {
+          selectedOpponent = null;
+          opponentGames = [];
+          comparison.innerHTML = '';
+        }
+        renderFriendsSection();
+      });
+      pillsBox.querySelectorAll('[data-board-friend]').forEach(btn => btn.onclick = async () => {
+        const fTag = btn.getAttribute('data-board-friend');
+        moonCompare = friendsDs === 'moon';
+        const moonChk = m.querySelector('#compare-moon');
+        if (moonChk) moonChk.checked = moonCompare;
+        search.value = fTag;
+        await loadComparison(fTag);
+        renderFriendsSection();
+        comparison.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      });
+    }
+  };
+
+  m.querySelectorAll('#friends-ds-tabs .tab-pill').forEach(btn => btn.onclick = () => {
+    friendsDs = btn.dataset.fds;
+    m.querySelectorAll('#friends-ds-tabs .tab-pill').forEach(b => b.classList.toggle('active', b === btn));
+    renderFriendsSection();
+  });
+
+  m.querySelectorAll('#friends-lim-tabs .tab-pill').forEach(btn => btn.onclick = () => {
+    friendsLim = btn.dataset.flim;
+    m.querySelectorAll('#friends-lim-tabs .tab-pill').forEach(b => b.classList.toggle('active', b === btn));
+    renderFriendsSection();
+  });
+
+  renderFriendsSection();
 
   let sort1v1Mode = 'newest';
   const render1v1HistoryBoxes = () => {
@@ -2301,10 +2676,14 @@ ${(() => {
           </div>
         </div>`;
 
+    const oppIsFriend = getMyFriends().includes(selectedOpponent);
     comparison.innerHTML = `<div class="head-to-head">
       <div class="head-to-head-title">
         <h3>${moonCompare ? 'Shoot the Moon' : 'Standard Play'} · Head-to-Head</h3>
-        <button class="btn small" id="clear-comparison">Clear</button>
+        <div style="display:flex; gap:6px;">
+          <button class="btn small" id="toggle-comp-friend">${oppIsFriend ? '✕ Unfriend' : '+ Friend'}</button>
+          <button class="btn small" id="clear-comparison">Clear</button>
+        </div>
       </div>
       <div class="pill-tabs sub" id="compare-limit-tabs" style="margin:6px 0 8px;">
         <button class="tab-pill ${compareLimit === 'all' ? 'active' : ''}" data-clim="all">All-Time</button>
@@ -2327,7 +2706,12 @@ ${(() => {
       renderComparison();
     });
 
-    comparison.querySelector('#clear-comparison').onclick = () => { selectedOpponent = null; opponentGames = []; comparison.innerHTML = ''; matches.innerHTML = ''; search.value = ''; };
+    comparison.querySelector('#toggle-comp-friend').onclick = async () => {
+      await toggleFriend(selectedOpponent);
+      renderComparison();
+      renderFriendsSection();
+    };
+    comparison.querySelector('#clear-comparison').onclick = () => { selectedOpponent = null; opponentGames = []; comparison.innerHTML = ''; matches.innerHTML = ''; search.value = ''; renderFriendsSection(); };
   };
 
   const lookupTags = async () => {
@@ -2361,13 +2745,243 @@ ${(() => {
 function viewHand(g) {
   if (!g?.boardSnapshot) return;
   const b = g.boardSnapshot;
-  let cells = '';
-  for (let r = 0; r < 4; r++) {
-    for (let c = 0; c < 4; c++) cells += `<div class="cell">${cardHTML(b.grid[r * 4 + c])}</div>`;
-    cells += `<div class="cell">${cardHTML(b.crib[r])}</div>`;
-  }
-  modal(`<h3>${escapeHTML(g.playerTag)} · ${Number(g.score)} pts</h3><div class="tray cut" style="margin:auto"><div class="lbl">CUT CARD</div><div class="slot">${cardHTML(b.cut)}</div></div>
-    <div class="grid" style="margin-top:8px">${cells}</div><div class="scores">${b.scores.map((s, i) => `<div class="sc">${['Hand 1', 'Hand 2', 'Hand 3', 'Hand 4', 'Crib'][i]}<b>${Number(s)}</b></div>`).join('')}</div>`);
+
+  const COMBO_META = {
+    '15':   { label: '15s',        color: '#f59e0b' },
+    pair:   { label: 'Pairs',      color: '#3b82f6' },
+    run:    { label: 'Run',        color: '#10b981' },
+    drun:   { label: 'Dbl Run',    color: '#a855f7' },
+    ddrun:  { label: '2x2 Run',    color: '#f43f5e' },
+    flush:  { label: 'Flush',      color: '#06b6d4' },
+    nobs:   { label: 'Nobs/Heels', color: '#facc15' },
+  };
+
+  // Collect combos per column (0..3 = Hands 1-4, 4 = Crib)
+  const colCombos = [0, 1, 2, 3, 4].map(c => {
+    const hand = c < 4 ? [0, 1, 2, 3].map(r => b.grid[r * 4 + c]) : b.crib;
+    const list = scoreHand(hand, b.cut, c === 4);
+    if (c === 4 && b.cut?.r === 11) {
+      list.unshift({ pts: 2, label: 'His Heels for 2', idx: [4], kind: 'nobs' });
+    }
+    return list;
+  });
+
+  const usedKinds = new Set();
+  colCombos.forEach(list => list.forEach(cb => usedKinds.add(cb.kind)));
+
+  let activeKind = null;
+  let activeCol = null;
+  let showColors = true;
+  let replayToken = 0;
+
+  const m = modal(`<h3>${escapeHTML(g.playerTag)} · ${Number(g.score)} pts</h3>
+    <div class="tray cut" style="margin:auto"><div class="lbl">CUT CARD</div><div class="slot" id="vh-cut">${cardHTML(b.cut)}</div></div>
+    <div id="vh-legend" style="display:flex; flex-wrap:wrap; gap:5px; justify-content:center; margin:8px 0 4px;"></div>
+    <div class="grid" id="vh-grid" style="margin-top:6px"></div>
+    <div class="scores" id="vh-scores" style="margin-top:6px"></div>
+    <div id="vh-breakdown" style="font-size:11px; opacity:.85; text-align:center; margin-top:6px; min-height:16px;"></div>`);
+
+  const runScoreReplay = async () => {
+    const token = ++replayToken;
+    activeKind = null;
+    activeCol = null;
+
+    const legendBox = m.querySelector('#vh-legend');
+    const gridEl = m.querySelector('#vh-grid');
+    const scoresBox = m.querySelector('#vh-scores');
+    const bd = m.querySelector('#vh-breakdown');
+
+    legendBox.innerHTML = `<button type="button" id="vh-stop-replay" style="font-size:11px; font-weight:700; padding:3px 10px; border-radius:999px; cursor:pointer; border:1px solid #f43f5e; background:rgba(244,63,94,.2); color:#fda4af;">⏹ Stop Replay</button>`;
+    legendBox.querySelector('#vh-stop-replay').onclick = () => {
+      replayToken++;
+      document.querySelectorAll('.badge').forEach(el => el.remove());
+      renderView();
+    };
+
+    // Reset grid (hide crib cards for dramatic flip) & zero out column scores
+    let cells = '';
+    for (let r = 0; r < 4; r++) {
+      for (let c = 0; c < 4; c++) {
+        const card = b.grid[r * 4 + c];
+        cells += `<div class="cell" data-r="${r}" data-c="${c}">${card ? cardHTML(card) : ''}</div>`;
+      }
+      const cribCard = b.crib[r];
+      cells += `<div class="cell crib" data-r="${r}" data-c="4">${cribCard ? cardHTML(cribCard, true) : ''}</div>`;
+    }
+    gridEl.innerHTML = cells;
+
+    const liveScores = [0, 0, 0, 0, 0];
+    scoresBox.innerHTML = liveScores.map((s, i) => {
+      const lbl = ['Hand 1', 'Hand 2', 'Hand 3', 'Hand 4', 'Crib'][i];
+      return `<div class="sc">${lbl}<b id="vh-sc-${i}">0</b></div>`;
+    }).join('');
+    bd.textContent = 'Replaying hand scoring…';
+
+    const flashReplayCombo = async (col, combo) => {
+      const nodes = combo.idx
+        .map(i => i === 4 ? m.querySelector('#vh-cut .card') : gridEl.querySelector(`.cell[data-r="${i}"][data-c="${col}"] .card`))
+        .filter(Boolean);
+      if (!nodes.length) nodes.push(m.querySelector('#vh-cut .card'));
+      const hlClass = settings.comboColors ? (COMBO_HL_CLASS[combo.kind] || 'hl') : 'hl';
+      nodes.forEach(n => n?.classList.add(hlClass));
+
+      liveScores[col] += combo.pts;
+      const runningTotal = liveScores.reduce((a, x) => a + x, 0);
+      const scEl = scoresBox.querySelector(`#vh-sc-${col}`);
+      if (scEl) {
+        scEl.textContent = liveScores[col];
+        scEl.classList.remove('pulse');
+        void scEl.offsetWidth;
+        scEl.classList.add('pulse');
+      }
+      bd.textContent = `${['Hand 1', 'Hand 2', 'Hand 3', 'Hand 4', 'Crib'][col]}: ${combo.label} (+${combo.pts})`;
+
+      const first = nodes.find(Boolean);
+      let badge = null;
+      if (first) {
+        const box = first.getBoundingClientRect();
+        badge = el(`<div class="badge" style="left:${box.left + box.width / 2}px;top:${box.top}px">+${combo.pts} · Total ${runningTotal}<small>${escapeHTML(combo.label)}</small></div>`);
+        document.body.appendChild(badge);
+      }
+
+      await sleep(settings.speed);
+      badge?.remove();
+      nodes.forEach(n => n?.classList.remove(hlClass));
+    };
+
+    for (let c = 0; c < 5; c++) {
+      if (token !== replayToken || !document.body.contains(m)) return;
+
+      // Dramatic Crib Flip before Crib combos
+      if (c === 4) {
+        await sleep(0.5);
+        for (let r = 0; r < 4; r++) {
+          if (token !== replayToken || !document.body.contains(m)) return;
+          const cribCell = gridEl.querySelector(`.cell[data-r="${r}"][data-c="4"]`);
+          if (cribCell && b.crib[r]) {
+            cribCell.innerHTML = cardHTML(b.crib[r], false);
+            cribCell.querySelector('.card')?.classList.add('crib-flip');
+            if (settings.sfx) { snap.currentTime = 0; snap.play().catch(() => {}); }
+            await sleep(Math.max(0.42, settings.speed * 0.85));
+          }
+        }
+        await sleep(0.25);
+      }
+
+      for (const combo of colCombos[c]) {
+        if (token !== replayToken || !document.body.contains(m)) return;
+        await flashReplayCombo(c, combo);
+      }
+    }
+
+    if (token === replayToken && document.body.contains(m)) {
+      await sleep(0.35);
+      renderView();
+    }
+  };
+
+  const renderView = () => {
+    const cellKinds = {};
+    const cutKinds = new Set();
+
+    colCombos.forEach((list, c) => {
+      if (activeCol !== null && activeCol !== c) return;
+      list.forEach(cb => {
+        if (activeKind !== null && cb.kind !== activeKind) return;
+        cb.idx.forEach(i => {
+          if (i === 4) cutKinds.add(cb.kind);
+          else (cellKinds[`${i}-${c}`] ??= new Set()).add(cb.kind);
+        });
+      });
+    });
+
+    const buildRingStyle = kindsSet => {
+      if (!showColors || !kindsSet || !kindsSet.size) return '';
+      const colors = [...kindsSet].map(k => COMBO_META[k]?.color).filter(Boolean);
+      const shadows = colors.map((col, idx) =>
+        idx === 0
+          ? `0 0 0 2.5px ${col}, 0 0 12px ${col}`
+          : `inset 0 0 0 ${2.5 * idx}px ${col}`
+      );
+      return `style="box-shadow:${shadows.join(', ')}; z-index:2;"`;
+    };
+
+    let cells = '';
+    for (let r = 0; r < 4; r++) {
+      for (let c = 0; c < 4; c++) {
+        const card = b.grid[r * 4 + c];
+        const rings = buildRingStyle(cellKinds[`${r}-${c}`]);
+        const dimmed = showColors && (activeKind !== null || activeCol !== null) && !cellKinds[`${r}-${c}`]?.size ? 'opacity:.42;' : '';
+        cells += `<div class="cell" style="${dimmed}">${card ? cardHTML(card).replace('<div class="card ', `<div ${rings} class="card `) : ''}</div>`;
+      }
+      const cribCard = b.crib[r];
+      const cribRings = buildRingStyle(cellKinds[`${r}-4`]);
+      const cribDim = showColors && (activeKind !== null || activeCol !== null) && !cellKinds[`${r}-4`]?.size ? 'opacity:.42;' : '';
+      cells += `<div class="cell crib" style="${cribDim}">${cribCard ? cardHTML(cribCard).replace('<div class="card ', `<div ${cribRings} class="card `) : ''}</div>`;
+    }
+    m.querySelector('#vh-grid').innerHTML = cells;
+
+    const cutSlot = m.querySelector('#vh-cut');
+    cutSlot.innerHTML = cardHTML(b.cut);
+    const cutCardEl = cutSlot.querySelector('.card');
+    if (cutCardEl && showColors && cutKinds.size) {
+      const cutCol = cutKinds.size === 1 ? COMBO_META[[...cutKinds][0]]?.color : '#facc15';
+      cutCardEl.style.boxShadow = `0 0 0 2.5px ${cutCol}, 0 0 14px ${cutCol}`;
+    }
+
+    const legendBox = m.querySelector('#vh-legend');
+    const pills = [...usedKinds].map(k => {
+      const meta = COMBO_META[k];
+      if (!meta) return '';
+      const isSel = activeKind === k;
+      return `<button type="button" data-vh-kind="${k}" style="font-size:11px; font-weight:700; padding:3px 8px; border-radius:999px; cursor:pointer; border:1.5px solid ${meta.color}; background:${isSel ? meta.color : 'rgba(0,0,0,.35)'}; color:${isSel ? '#111827' : '#f8fafc'}; box-shadow:0 0 8px ${meta.color}55;">● ${meta.label}</button>`;
+    }).join('');
+
+    legendBox.innerHTML = `
+      <button type="button" id="vh-replay-btn" style="font-size:11px; font-weight:700; padding:3px 9px; border-radius:999px; cursor:pointer; border:1px solid #34d399; background:rgba(16,185,129,.18); color:#6ee7b7;">
+        ▶ Replay
+      </button>
+      <button type="button" id="vh-toggle-colors" style="font-size:11px; font-weight:700; padding:3px 8px; border-radius:999px; cursor:pointer; border:1px solid rgba(243,210,122,.6); background:rgba(243,210,122,.15); color:#f3d27a;">
+        ${showColors ? '🎨 Colors: ON' : '🎨 Colors: OFF'}
+      </button>
+      ${showColors ? pills : ''}`;
+
+    legendBox.querySelector('#vh-replay-btn').onclick = runScoreReplay;
+    legendBox.querySelector('#vh-toggle-colors').onclick = () => {
+      showColors = !showColors;
+      if (!showColors) { activeKind = null; activeCol = null; }
+      renderView();
+    };
+    legendBox.querySelectorAll('[data-vh-kind]').forEach(btn => btn.onclick = () => {
+      const k = btn.getAttribute('data-vh-kind');
+      activeKind = activeKind === k ? null : k;
+      renderView();
+    });
+
+    const scoresBox = m.querySelector('#vh-scores');
+    scoresBox.innerHTML = b.scores.map((s, i) => {
+      const lbl = ['Hand 1', 'Hand 2', 'Hand 3', 'Hand 4', 'Crib'][i];
+      const isSel = activeCol === i;
+      return `<div class="sc" data-vh-col="${i}" style="cursor:pointer; ${isSel ? 'outline:2px solid #facc15; background:rgba(250,204,21,.18);' : ''}" title="Tap to inspect ${lbl}">${lbl}<b>${Number(s)}</b></div>`;
+    }).join('');
+
+    scoresBox.querySelectorAll('[data-vh-col]').forEach(box => box.onclick = () => {
+      const c = Number(box.getAttribute('data-vh-col'));
+      activeCol = activeCol === c ? null : c;
+      renderView();
+    });
+
+    const bd = m.querySelector('#vh-breakdown');
+    if (activeCol !== null) {
+      const name = ['Hand 1', 'Hand 2', 'Hand 3', 'Hand 4', 'Crib'][activeCol];
+      const items = colCombos[activeCol].map(cb => `${cb.label} (+${cb.pts})`);
+      bd.textContent = items.length ? `${name}: ${items.join(' · ')}` : `${name}: 0 pts`;
+    } else {
+      bd.textContent = 'Tip: Tap ▶ Replay to animate, or tap any pill/column to isolate combos.';
+    }
+  };
+
+  renderView();
 }
 
 function ensureMusicPlaying() {
