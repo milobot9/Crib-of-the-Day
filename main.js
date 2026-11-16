@@ -14,6 +14,13 @@ const playlist = [
   'assets/audio/lounge-music6.mp3',
   'assets/audio/lounge-music7.mp3',
   'assets/audio/lounge-music8.mp3',
+  'assets/audio/lounge-music9.mp3',
+  'assets/audio/lounge-music10.mp3',
+  'assets/audio/lounge-music11.mp3',
+  'assets/audio/lounge-music12.mp3',
+  'assets/audio/lounge-music13.mp3',
+  'assets/audio/lounge-music14.mp3',
+  'assets/audio/lounge-music15.mp3',
 ];
 
 const hotPlaylist = [
@@ -32,11 +39,27 @@ const EGG_COOLDOWN_MS = 30 * 60 * 1000;
 const HOT_COOLDOWN_MS = 15 * 60 * 1000;
 const TARGET_VOL = 0.35;
 
-let trackIdx = Math.floor(Math.random() * playlist.length);
+let shuffledQueue = [];
+let currentLoungeTrack = null;
 let playingSpecialTrack = false;
 let hotStreakQueue = [];
 
-const deckA = new Audio(playlist[trackIdx]);
+function nextShuffledLoungeTrack() {
+  if (shuffledQueue.length === 0) {
+    shuffledQueue = [...playlist];
+    for (let i = shuffledQueue.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [shuffledQueue[i], shuffledQueue[j]] = [shuffledQueue[j], shuffledQueue[i]];
+    }
+    if (shuffledQueue.length > 1 && shuffledQueue[0] === currentLoungeTrack) {
+      shuffledQueue.push(shuffledQueue.shift());
+    }
+  }
+  currentLoungeTrack = shuffledQueue.shift();
+  return currentLoungeTrack;
+}
+
+const deckA = new Audio(nextShuffledLoungeTrack());
 const deckB = new Audio();
 deckA.volume = TARGET_VOL;
 deckB.volume = 0;
@@ -119,8 +142,30 @@ function handleTrackEnded() {
   if (!playingSpecialTrack && Math.random() < 0.01 && canTriggerEgg('gambler')) {
     playSpecialTrack(gamblerTrack, 'gambler');
   } else {
-    trackIdx = (trackIdx + 1) % playlist.length;
-    crossfadeTo(playlist[trackIdx], false);
+    crossfadeTo(nextShuffledLoungeTrack(), false);
+  }
+}
+
+function check1v1LossStreakEasterEgg() {
+  if (!profile) return;
+  const completed1v1 = allChallenges
+    .filter(c => c.status === 'completed' && (c.challenger_tag === profile.tag || c.opponent_tag === profile.tag))
+    .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+
+  if (completed1v1.length < 3) return;
+  const lastThree = completed1v1.slice(0, 3);
+  const lostThreeStraight = lastThree.every(c =>
+    c.winner_tag && c.winner_tag !== 'TIE' && c.winner_tag !== profile.tag
+  );
+
+  if (lostThreeStraight && Math.random() < 0.60) {
+    const pool = [];
+    if (canTriggerEgg('gambler')) pool.push({ src: gamblerTrack, key: 'gambler' });
+    if (canTriggerEgg('loser')) pool.push({ src: loserTrack, key: 'loser' });
+    if (pool.length > 0) {
+      const pick = pool[Math.floor(Math.random() * pool.length)];
+      playSpecialTrack(pick.src, pick.key);
+    }
   }
 }
 
@@ -269,15 +314,89 @@ async function refreshCloudData() {
   if (gamesRes.data) allGames = gamesRes.data.map(mapGame);
   if (profilesRes.data) profiles = profilesRes.data.map(mapProfile);
   if (potRow) livePot = Number(potRow.pot_amount ?? 10);
-  if (championsRes.data) champions = championsRes.data;
-  if (challengesRes.data) allChallenges = challengesRes.data;
+if (championsRes.data) champions = championsRes.data;
+  if (challengesRes.data) {
+    allChallenges = challengesRes.data;
+    await expireStale1v1Challenges();
+  }
   renderHud();
 }
 
-function best3Of4Avg(scores) {
-  const sorted = [...scores].map(Number).sort((a, b) => b - a).slice(0, 3);
-  return sorted.reduce((a, b) => a + b, 0) / sorted.length;
-}	
+async function expireStale1v1Challenges() {
+  if (!profile) return;
+  const today = todayKey();
+  let changed = false;
+
+  for (const c of allChallenges) {
+    if (c.status === 'completed' || c.status === 'expired') continue;
+    if (!c.date_key || c.date_key >= today) continue;
+
+    const stake = Number(c.stake || 2);
+    const oScores = Array.isArray(c.opponent_scores) ? c.opponent_scores : [];
+
+    const { error } = await supabase
+      .from('challenges_1v1')
+      .update({ status: 'expired', winner_tag: 'EXPIRED', coins_won: 0 })
+      .eq('id', c.id)
+      .neq('status', 'expired');
+
+    if (!error) {
+      changed = true;
+      if (c.challenger_tag === profile.tag) {
+        await changeCoins(stake);
+      } else {
+        const cProf = profiles.find(p => p.tag === c.challenger_tag);
+        if (cProf) await supabase.from('profiles').update({ coins: Number(cProf.coins) + stake }).eq('tag', c.challenger_tag);
+      }
+      if (c.status === 'active' || oScores.length > 0) {
+        if (c.opponent_tag === profile.tag) {
+          await changeCoins(stake);
+        } else {
+          const oProf = profiles.find(p => p.tag === c.opponent_tag);
+          if (oProf) await supabase.from('profiles').update({ coins: Number(oProf.coins) + stake }).eq('tag', c.opponent_tag);
+        }
+      }
+    }
+  }
+
+  if (changed) {
+    const { data } = await supabase.from('challenges_1v1').select('*').order('created_at', { ascending: false });
+    if (data) allChallenges = data;
+  }
+}
+
+// Grand total of top 3 hands (lowest 3 for Moon Battle, highest 3 for Standard)
+function top3Total1v1(entries, isMoonBattle = false) {
+  const vals = (Array.isArray(entries) ? entries : [])
+    .slice(0, 4)
+    .map(item => (typeof item === 'object' && item !== null ? Number(item.score) : Number(item)))
+    .filter(Number.isFinite);
+  if (!vals.length) return 0;
+  const sorted = isMoonBattle ? [...vals].sort((a, b) => a - b) : [...vals].sort((a, b) => b - a);
+  return sorted.slice(0, 3).reduce((sum, x) => sum + x, 0);
+}
+
+// Supports both numbers and { score, moonGambleMissed } entries
+function score1v1Series(entries, isMoonBattle = false) {
+  const normalized = entries.slice(0, 4).map(item =>
+    typeof item === 'object' && item !== null
+      ? { val: Number(item.score), missedMoon: Boolean(item.moonGambleMissed) }
+      : { val: Number(item), missedMoon: false }
+  );
+  if (!normalized.length) return 0;
+
+  if (isMoonBattle) {
+    const best3 = [...normalized].sort((a, b) => a.val - b.val).slice(0, 3);
+    return best3.reduce((sum, x) => sum + x.val, 0) / best3.length;
+  }
+
+  const sortedDesc = [...normalized].sort((a, b) => b.val - a.val);
+  const kept3 = sortedDesc.slice(0, 3);
+  const dropped = sortedDesc[3];
+  const baseAvg = kept3.reduce((sum, x) => sum + x.val, 0) / kept3.length;
+  const penalty = dropped && dropped.missedMoon ? 2 : 0;
+  return baseAvg - penalty;
+}
 
 async function refreshLivePot() {
   const row = await fetchPersistentPotRow();
@@ -432,7 +551,13 @@ function render() {
     <header><button class="btn small" id="home">⌂</button><h1>Crib of the Day</h1>
     <span><button class="btn small" id="help">?</button> <button class="btn small" id="set">⚙</button></span></header>
     <div class="hud" id="hud"></div><div id="main"></div>`;
-  root.querySelector('#home').onclick = () => { if (!game || game.done) { game = null; save('cotd_game', null); render(); } };
+  root.querySelector('#home').onclick = () => {
+    if (!game || game.done || game.mode === '1v1') {
+      game = null;
+      save('cotd_game', null);
+      render();
+    }
+  };
   root.querySelector('#help').onclick = showRules;
   root.querySelector('#set').onclick = showSettings;
   renderHud();
@@ -597,35 +722,85 @@ function renderHome() {
   const alreadyPlayed = hasPlayedDailyToday();
   const main = root.querySelector('#main');
 
-  const myInbox = allChallenges.filter(c =>
-    c.status !== 'completed' &&
-    (c.opponent_tag === profile.tag || c.challenger_tag === profile.tag)
+  const myTodayMatches = allChallenges.filter(c =>
+    c.date_key === todayKey() &&
+    c.status !== 'expired' &&
+    (String(c.opponent_tag).toUpperCase() === profile.tag || String(c.challenger_tag).toUpperCase() === profile.tag)
   );
-  const pendingCount = myInbox.filter(c => {
-    const isChallenger = c.challenger_tag === profile.tag;
-    const myScores = isChallenger ? (c.challenger_scores || []) : (c.opponent_scores || []);
+  const activeToday = myTodayMatches.filter(c => c.status !== 'completed');
+  const completedToday = myTodayMatches.filter(c => c.status === 'completed');
+
+  const pendingCount = activeToday.filter(c => {
+    const isChallenger = String(c.challenger_tag).toUpperCase() === profile.tag;
+    const myScores = Array.isArray(isChallenger ? c.challenger_scores : c.opponent_scores)
+      ? (isChallenger ? c.challenger_scores : c.opponent_scores)
+      : [];
     return myScores.length < 4;
   }).length;
 
-  const inboxHTML = myInbox.map(c => {
-    const isChallenger = c.challenger_tag === profile.tag;
+  const inboxHTML = activeToday.map(c => {
+    const isChallenger = String(c.challenger_tag).toUpperCase() === profile.tag;
     const rival = isChallenger ? c.opponent_tag : c.challenger_tag;
-    const myScores = isChallenger ? (c.challenger_scores || []) : (c.opponent_scores || []);
-    const theirScores = isChallenger ? (c.opponent_scores || []) : (c.challenger_scores || []);
+    const myScores = Array.isArray(isChallenger ? c.challenger_scores : c.opponent_scores)
+      ? (isChallenger ? c.challenger_scores : c.opponent_scores)
+      : [];
+    const theirScores = Array.isArray(isChallenger ? c.opponent_scores : c.challenger_scores)
+      ? (isChallenger ? c.opponent_scores : c.challenger_scores)
+      : [];
     const myDone = myScores.length >= 4;
     const stake = Number(c.stake || 2);
+    const isMoon1v1 = Boolean(c.is_moon_battle);
+    const myTop3 = top3Total1v1(myScores, isMoon1v1);
+    const theirTop3 = top3Total1v1(theirScores, isMoon1v1);
+    const needsAccept = !isChallenger && c.status === 'pending' && myScores.length === 0;
     const actionLabel = myDone
       ? `Waiting (${theirScores.length}/4)`
-      : (!isChallenger && myScores.length === 0 ? `Accept & Play (${stake}🪙)` : `Play Hand ${myScores.length + 1}/4`);
+      : (needsAccept ? `Accept & Play (${stake}🪙)` : `Play Hand ${myScores.length + 1}/4`);
 
-    return `<div class="row" style="padding:8px; border:1px solid rgba(243,210,122,.4); border-radius:8px; background:rgba(0,0,0,.25); margin:6px 0;">
-      <div style="font-size:12px;">
-        <b>vs ${escapeHTML(rival)}</b> · ${stake}🪙 Pay-In<br>
-        <span style="opacity:.85;">You: ${myScores.length}/4 · Them: ${theirScores.length}/4</span>
+    return `<div class="row" style="padding:8px; border:1px solid rgba(243,210,122,.4); border-radius:8px; background:rgba(0,0,0,.25); margin:6px 0; gap:8px;">
+      <div style="font-size:12px; flex:1;">
+        <b>vs ${escapeHTML(rival)}</b> · ${isMoon1v1 ? '🌙 Moon' : '⚔️ Regular'} · ${stake}🪙<br>
+        <span style="opacity:.85;">Hands: You ${myScores.length}/4 · Them ${theirScores.length}/4</span>
+      </div>
+      <div style="text-align:right; font-size:12px; padding:4px 8px; border-radius:6px; background:rgba(243,210,122,.12); border:1px solid rgba(243,210,122,.35);">
+        <div style="font-size:10px; opacity:.8;">TOP-3 SCORE</div>
+        <b>You ${myTop3}</b> vs <b>${theirTop3}</b>
       </div>
       <button class="btn small gold-btn" data-play-1v1="${escapeHTML(c.id)}" ${myDone ? 'disabled' : ''}>${actionLabel}</button>
     </div>`;
   }).join('') || '<p style="font-size:12px; opacity:.8; margin:4px 0;">No active 1v1 matches right now.</p>';
+
+  const completedTodayHTML = completedToday.map(c => {
+    const isChallenger = String(c.challenger_tag).toUpperCase() === profile.tag;
+    const rival = isChallenger ? c.opponent_tag : c.challenger_tag;
+    const myScores = Array.isArray(isChallenger ? c.challenger_scores : c.opponent_scores)
+      ? (isChallenger ? c.challenger_scores : c.opponent_scores)
+      : [];
+    const theirScores = Array.isArray(isChallenger ? c.opponent_scores : c.challenger_scores)
+      ? (isChallenger ? c.opponent_scores : c.challenger_scores)
+      : [];
+    const isMoon1v1 = Boolean(c.is_moon_battle);
+    const myTop3 = top3Total1v1(myScores, isMoon1v1);
+    const theirTop3 = top3Total1v1(theirScores, isMoon1v1);
+    const margin = Number(c.coins_won || 0);
+    const won = c.winner_tag === profile.tag;
+    const tie = c.winner_tag === 'TIE';
+    const outcomeText = tie
+      ? 'TIE (2🪙 returned)'
+      : (won ? `WON by ${margin} (+${margin}🪙)` : `LOST by ${margin} (−${margin}🪙)`);
+    const badgeColor = tie ? '#f3d27a' : (won ? '#7ee787' : '#ff8b8b');
+
+    return `<div class="row" style="padding:8px; border:1px solid rgba(255,255,255,.22); border-radius:8px; background:rgba(0,0,0,.3); margin:6px 0; gap:8px;">
+      <div style="font-size:12px; flex:1;">
+        <b>vs ${escapeHTML(rival)}</b> · ${isMoon1v1 ? '🌙 Moon' : '⚔️ Regular'}<br>
+        <span style="color:${badgeColor}; font-weight:700;">${outcomeText}</span>
+      </div>
+      <div style="text-align:right; font-size:12px; padding:4px 8px; border-radius:6px; background:rgba(255,255,255,.08);">
+        <div style="font-size:10px; opacity:.8;">FINAL TOP-3</div>
+        <b>You ${myTop3}</b> vs <b>${theirTop3}</b>
+      </div>
+    </div>`;
+  }).join('') || '<p style="font-size:12px; opacity:.75; margin:4px 0;">No completed 1v1 matches yet today.</p>';
 
   main.innerHTML = `<div class="felt">
     <button class="btn" id="daily" style="width:100%" ${alreadyPlayed ? 'disabled' : ''}>Crib of the Day ${alreadyPlayed ? '(done today)' : '· 1 Coin'}</button>
@@ -646,16 +821,18 @@ function renderHome() {
     </div>
 
     <div id="hub-1v1" style="display:${pendingCount ? 'block' : 'none'}; margin-top:8px; padding:12px; border:1px solid #f3d27a; border-radius:10px; background:rgba(0,0,0,.35);">
-      <div class="eyebrow">1V1 ARENA · BEST 3 OF 4 HANDS · 2 COIN PAY-IN</div>
-      <p style="margin:4px 0 8px; font-size:12px;">2 Coins to enter. Winner earns Coins equal to their Best-3-of-4 average lead (rounded down). 1 challenge per opponent per day.</p>
+      <div class="eyebrow">1V1 ARENA · TOP 3 OF 4 HANDS · 2 COIN PAY-IN</div>
+      <p style="margin:4px 0 8px; font-size:12px;">Challenge each rival up to once in <b>Regular</b> and once in <b>Shoot the Moon</b> per day (2🪙 each). Matches reset at midnight—unfinished games forfeit with a full 2-Coin refund.</p>
       <div class="compare-search-row">
         <input type="search" id="home-1v1-search" placeholder="Tag (ACE#1) or Initials (ACE)" autocomplete="off">
         <button class="btn small" id="home-1v1-find" type="button">Find</button>
       </div>
       <div id="home-1v1-matches" style="margin-top:6px;"></div>
       <p class="error-text" id="home-1v1-msg" style="margin:4px 0;"></p>
-      <h4 style="margin:10px 0 4px; color:#f3d27a; font-size:13px;">Your 1v1 Inbox &amp; Active Matches</h4>
+      <h4 style="margin:10px 0 4px; color:#f3d27a; font-size:13px;">Active Matches &amp; Inbox</h4>
       ${inboxHTML}
+      <h4 style="margin:12px 0 4px; color:#f3d27a; font-size:13px;">Completed Today (Resets at Midnight)</h4>
+      ${completedTodayHTML}
     </div>
 
     <label class="row">Auto-Fill Row 1 <input type="checkbox" id="af" ${settings.autofill ? 'checked' : ''}></label>
@@ -672,8 +849,15 @@ function renderHome() {
   main.querySelector('#lb').onclick = showBoards;
 
   const hub1v1 = main.querySelector('#hub-1v1');
-  main.querySelector('#toggle-1v1').onclick = () => {
-    hub1v1.style.display = hub1v1.style.display === 'block' ? 'none' : 'block';
+  main.querySelector('#toggle-1v1').onclick = async () => {
+    const opening = hub1v1.style.display !== 'block';
+    hub1v1.style.display = opening ? 'block' : 'none';
+    if (opening) {
+      await refreshCloudData();
+      renderHome();
+      const reopened = root.querySelector('#hub-1v1');
+      if (reopened) reopened.style.display = 'block';
+    }
   };
 
   const search1v1 = main.querySelector('#home-1v1-search');
@@ -691,53 +875,108 @@ function renderHome() {
     const { data } = await q;
     const list = (data ?? []).filter(p => p.tag !== profile.tag);
     if (!list.length) { matches1v1.innerHTML = '<p style="font-size:12px;">No matching players found.</p>'; return; }
-    matches1v1.innerHTML = `<div class="tag-options">${list.map(p => `<button class="btn small gold-btn" data-send-rival="${escapeHTML(p.tag)}">⚔️ Challenge ${escapeHTML(p.tag)} (2🪙)</button>`).join('')}</div>`;
+    matches1v1.innerHTML = list.map(p => `
+      <div class="row" style="padding:6px 8px; margin:4px 0; border-radius:8px; background:rgba(255,255,255,.06); gap:6px;">
+        <b style="font-size:13px;">${escapeHTML(p.tag)}</b>
+        <div style="display:flex; gap:6px;">
+          <button class="btn small gold-btn" data-send-rival="${escapeHTML(p.tag)}" data-send-moon="0">⚔️ Regular (2🪙)</button>
+          <button class="btn small" data-send-rival="${escapeHTML(p.tag)}" data-send-moon="1">🌙 Moon (2🪙)</button>
+        </div>
+      </div>`).join('');
+
     matches1v1.querySelectorAll('[data-send-rival]').forEach(btn => btn.onclick = async () => {
-      const rival = btn.dataset.sendRival;
+      const rival = btn.getAttribute('data-send-rival');
+      const isMoonBattle = btn.getAttribute('data-send-moon') === '1';
+      const modeLabel = isMoonBattle ? 'Shoot the Moon' : 'Regular';
       const alreadyToday = allChallenges.some(c =>
         c.date_key === todayKey() &&
+        c.status !== 'expired' &&
+        Boolean(c.is_moon_battle) === isMoonBattle &&
         ((c.challenger_tag === profile.tag && c.opponent_tag === rival) ||
          (c.challenger_tag === rival && c.opponent_tag === profile.tag))
       );
-      if (alreadyToday) { msg1v1.textContent = `You already have a 1v1 with ${rival} today.`; return; }
+      if (alreadyToday) { msg1v1.textContent = `You already have a ${modeLabel} 1v1 with ${rival} today.`; return; }
       if (Number(profile.coins) < 2) { msg1v1.textContent = 'You need at least 2 Coins to send a 1v1.'; return; }
       btn.disabled = true;
+      const prevText = btn.textContent;
       btn.textContent = 'Sending…';
       const { data: created, error } = await supabase.from('challenges_1v1').insert({
         challenger_tag: profile.tag,
         opponent_tag: rival,
         date_key: todayKey(),
         stake: 2,
-        scoring_rule: 'best_3_of_4',
+        is_moon_battle: isMoonBattle,
+        scoring_rule: isMoonBattle ? 'moon_best_3_of_4' : 'best_3_of_4',
         status: 'pending',
+        challenger_scores: [],
+        opponent_scores: [],
       }).select('*').single();
       if (error || !created) {
-        msg1v1.textContent = 'Could not send challenge. Check SQL setup.';
+        logSupabaseError('create 1v1 challenge', error);
+        msg1v1.textContent = `Could not send challenge: ${error?.message || 'Check SQL setup.'}`;
         btn.disabled = false;
+        btn.textContent = prevText;
         return;
       }
       await changeCoins(-2);
-      await refreshCloudData();
+      allChallenges = [created, ...allChallenges];
       active1v1Id = created.id;
-      startGame('1v1', false, null);
+      startGame('1v1', isMoonBattle, null, isMoonBattle);
     });
   };
 
   main.querySelectorAll('[data-play-1v1]').forEach(btn => btn.onclick = async () => {
-    const cid = btn.dataset.play1v1;
-    const ch = allChallenges.find(x => String(x.id) === String(cid));
-    if (!ch) return;
-    const stake = Number(ch.stake || 2);
-    const isChallenger = ch.challenger_tag === profile.tag;
-    const myScores = isChallenger ? (ch.challenger_scores || []) : (ch.opponent_scores || []);
-    if (!isChallenger && myScores.length === 0) {
-      if (Number(profile.coins) < stake) { msg1v1.textContent = `Need ${stake} Coins to accept.`; return; }
-      btn.disabled = true;
-      await changeCoins(-stake);
-      await supabase.from('challenges_1v1').update({ status: 'active' }).eq('id', ch.id);
+  const cid = btn.getAttribute('data-play-1v1');
+    btn.disabled = true;
+    const prevLabel = btn.textContent;
+    btn.textContent = 'Loading…';
+
+    const { data: ch, error: fetchErr } = await supabase
+      .from('challenges_1v1')
+      .select('*')
+      .eq('id', cid)
+      .maybeSingle();
+
+    if (fetchErr || !ch) {
+      logSupabaseError('fetch 1v1 match by id', fetchErr);
+      msg1v1.textContent = fetchErr ? `Error: ${fetchErr.message}` : 'Match no longer exists—refreshing…';
+      await refreshCloudData();
+      renderHome();
+      return;
     }
+
+    const stake = Number(ch.stake || 2);
+    const isChallenger = String(ch.challenger_tag).toUpperCase() === profile.tag;
+    const myScores = Array.isArray(isChallenger ? ch.challenger_scores : ch.opponent_scores)
+      ? (isChallenger ? ch.challenger_scores : ch.opponent_scores)
+      : [];
+    if (myScores.length >= 4) {
+      await refreshCloudData();
+      renderHome();
+      return;
+    }
+
+    if (!isChallenger && ch.status === 'pending' && myScores.length === 0) {
+      if (Number(profile.coins) < stake) {
+        msg1v1.textContent = `Need ${stake} Coins to accept.`;
+        btn.disabled = false;
+        btn.textContent = prevLabel;
+        return;
+      }
+      btn.textContent = 'Joining…';
+      const { error } = await supabase.from('challenges_1v1').update({ status: 'active' }).eq('id', ch.id);
+      if (error) {
+        logSupabaseError('accept 1v1 challenge', error);
+        msg1v1.textContent = `Could not join match: ${error.message}`;
+        btn.disabled = false;
+        btn.textContent = prevLabel;
+        return;
+      }
+      await changeCoins(-stake);
+    }
+
     active1v1Id = ch.id;
-    startGame('1v1', false, null);
+    startGame('1v1', Boolean(ch.is_moon_battle), null, Boolean(ch.is_moon_battle));
   });
 
   main.querySelector('#daily').onclick = () => {
@@ -777,12 +1016,15 @@ function renderHome() {
   };
 }
 
-function startGame(mode, moon, predictedScore) {
+function startGame(mode, moon, predictedScore, isMoonBattle = false) {
   const deck = makeDeck(mode === 'daily' ? `cotd-${todayKey()}` : '');
+  const forceMoon = mode === '1v1' && Boolean(isMoonBattle);
   game = {
     playerTag: profile.tag,
     mode,
-    moon: Boolean(moon),
+    challengeId: mode === '1v1' ? active1v1Id : null,
+    isMoonBattle: forceMoon,
+    moon: forceMoon ? true : Boolean(moon),
     predictedScore: mode === 'daily' ? Number(predictedScore) : null,
     deck,
     grid: Array(16).fill(null),
@@ -803,14 +1045,50 @@ function startGame(mode, moon, predictedScore) {
 
 function placed() { return game.grid.filter(Boolean).length; }
 
+function getLive1v1BoxHTML() {
+  if (!game || game.mode !== '1v1') return '';
+  const chId = game.challengeId || active1v1Id;
+  const ch = allChallenges.find(x => String(x.id) === String(chId));
+  const isMoon1v1 = Boolean(ch?.is_moon_battle ?? game.isMoonBattle);
+  const isChallenger = ch ? String(ch.challenger_tag).toUpperCase() === profile.tag : true;
+  const rival = ch ? (isChallenger ? ch.opponent_tag : ch.challenger_tag) : 'Rival';
+  const prevMy = ch && Array.isArray(isChallenger ? ch.challenger_scores : ch.opponent_scores)
+    ? (isChallenger ? ch.challenger_scores : ch.opponent_scores)
+    : [];
+  const theirScores = ch && Array.isArray(isChallenger ? ch.opponent_scores : ch.challenger_scores)
+    ? (isChallenger ? ch.opponent_scores : ch.challenger_scores)
+    : [];
+
+  const currentHandTotal = game.scores.reduce((a, b) => a + b, 0);
+  let currentEntry = currentHandTotal;
+  if (!isMoon1v1 && game.moon && game.done && currentHandTotal <= 10) currentEntry = 55;
+
+  const mySeries = game.done && game.recordSaved ? prevMy : [...prevMy, currentEntry];
+  const myTop3 = top3Total1v1(mySeries, isMoon1v1);
+  const theirTop3 = top3Total1v1(theirScores, isMoon1v1);
+  const handNum = Math.min(4, (game.done && game.recordSaved ? prevMy.length : prevMy.length + 1));
+
+  return `<div id="live-1v1-box" class="row" style="margin:6px 0 8px; padding:8px 10px; border:1px solid #f3d27a; border-radius:8px; background:rgba(0,0,0,.35); font-size:12px;">
+    <div>
+      <b>${isMoon1v1 ? '🌙 Moon 1v1' : '⚔️ 1v1'} vs ${escapeHTML(rival)}</b> · Hand ${handNum}/4<br>
+      <span style="opacity:.85;">This hand: ${currentHandTotal} pts</span>
+    </div>
+    <div style="text-align:right;">
+      <div style="font-size:10px; opacity:.8;">CUMULATIVE TOP-3</div>
+      <b style="font-size:14px; color:#f3d27a;">You: ${myTop3}</b> · <span>Them: ${theirTop3}</span>
+    </div>
+  </div>`;
+}
+
 function renderBoard() {
   const main = root.querySelector('#main');
   if (!main) return;
   const n = placed();
-  const moonLocked = game.moon || n >= 7;
+  const moonLocked = game.moon || n >= 8;
   main.innerHTML = `<div class="felt"><div class="trays">
       <div class="tray"><div class="lbl">NEXT CARD</div><div class="slot" id="next"></div></div>
       <div class="tray cut"><div class="lbl">CUT CARD</div><div class="slot" id="cut"></div></div></div>
+    ${getLive1v1BoxHTML()}
     <label class="row">🌙 Shoot the Moon ${game.moon ? '(ON)' : ''} <input type="checkbox" id="moon" ${game.moon ? 'checked' : ''} ${moonLocked ? 'disabled' : ''}></label>
     <div class="grid" id="grid"></div>
     <div class="scores">${['Hand 1', 'Hand 2', 'Hand 3', 'Hand 4', 'Crib'].map((l, i) => `<div class="sc">${l}<b id="sc${i}">${game.scores[i]}</b></div>`).join('')}</div>
@@ -900,6 +1178,8 @@ async function flash(idx, col, combo) {
     scoreBox.textContent = game.scores[col];
     scoreBox.classList.remove('pulse'); void scoreBox.offsetWidth; scoreBox.classList.add('pulse');
   }
+  const live1v1El = root.querySelector('#live-1v1-box');
+  if (live1v1El) live1v1El.outerHTML = getLive1v1BoxHTML();
   await sleep(settings.speed);
   badge.remove();
   nodes.forEach(n => n?.classList.remove('hl'));
@@ -936,24 +1216,53 @@ async function finishGame() {
   game.finishing = false;
   save('cotd_game', game);
 
-  if (game.mode === '1v1' && active1v1Id) {
-    const { data: freshCh } = await supabase.from('challenges_1v1').select('*').eq('id', active1v1Id).single();
-    if (freshCh) {
-      const isChallenger = freshCh.challenger_tag === profile.tag;
+  const chId = game.challengeId || active1v1Id;
+  if (game.mode === '1v1' && chId) {
+    const { data: freshCh } = await supabase.from('challenges_1v1').select('*').eq('id', chId).single();
+    if (freshCh && freshCh.status !== 'expired') {
+      const isMoonBattle = Boolean(freshCh.is_moon_battle);
+      const isChallenger = String(freshCh.challenger_tag).toUpperCase() === profile.tag;
       const field = isChallenger ? 'challenger_scores' : 'opponent_scores';
-      const updatedArr = [...(freshCh[field] || []), score];
+      const prevArr = Array.isArray(freshCh[field]) ? freshCh[field] : [];
+
+      // Build recorded entry:
+      // - In designated Moon 1v1: raw score (lowest 3 of 4 wins)
+      // - In Standard 1v1 with Moon toggled ON: <=10 counts as 55; >10 counts as raw score with moonGambleMissed flag
+      let entry;
+      if (isMoonBattle) {
+        entry = score;
+        game.effective1v1Label = `${score} pts (Moon Battle)`;
+      } else if (game.moon) {
+        if (score <= 10) {
+          entry = 55;
+          game.effective1v1Label = `🌙 Moon Shot! Counts as 55 pts`;
+        } else {
+          entry = { score, moonGambleMissed: true };
+          game.effective1v1Label = `Moon Missed (${score} pts · −2 avg penalty if dropped)`;
+        }
+      } else {
+        entry = score;
+        game.effective1v1Label = `${score} pts`;
+      }
+
+      const updatedArr = prevArr.length < 4 ? [...prevArr, entry] : prevArr;
       const patch = { [field]: updatedArr };
 
-      const cScores = isChallenger ? updatedArr : (freshCh.challenger_scores || []);
-      const oScores = isChallenger ? (freshCh.opponent_scores || []) : updatedArr;
+      const cScores = isChallenger ? updatedArr : (Array.isArray(freshCh.challenger_scores) ? freshCh.challenger_scores : []);
+      const oScores = isChallenger ? (Array.isArray(freshCh.opponent_scores) ? freshCh.opponent_scores : []) : updatedArr;
 
       if (cScores.length >= 4 && oScores.length >= 4 && freshCh.status !== 'completed') {
-        const cAvg = best3Of4Avg(cScores);
-        const oAvg = best3Of4Avg(oScores);
+        const cAvg = score1v1Series(cScores, isMoonBattle);
+        const oAvg = score1v1Series(oScores, isMoonBattle);
         const stake = Number(freshCh.stake || 2);
         const diff = Math.abs(cAvg - oAvg);
         const marginWon = Math.floor(diff);
-        const winnerTag = marginWon <= 0 ? 'TIE' : (cAvg > oAvg ? freshCh.challenger_tag : freshCh.opponent_tag);
+
+        let winnerTag = 'TIE';
+        if (marginWon > 0) {
+          const challengerWins = isMoonBattle ? (cAvg < oAvg) : (cAvg > oAvg);
+          winnerTag = challengerWins ? freshCh.challenger_tag : freshCh.opponent_tag;
+        }
 
         patch.status = 'completed';
         patch.challenger_avg = Number(cAvg.toFixed(2));
@@ -981,12 +1290,16 @@ async function finishGame() {
           if (winProf) await supabase.from('profiles').update({ coins: Number(winProf.coins) + stake + marginWon }).eq('tag', winnerTag);
         }
       }
-      await supabase.from('challenges_1v1').update(patch).eq('id', active1v1Id);
+      await supabase.from('challenges_1v1').update(patch).eq('id', chId);
+      game.handsCompleted1v1 = updatedArr.length;
+      game.isMoonBattle1v1 = isMoonBattle;
+      save('cotd_game', game);
       if (updatedArr.length >= 4) active1v1Id = null;
     }
   }
 
-  await refreshCloudData();
+ await refreshCloudData();
+  if (game.mode === '1v1') check1v1LossStreakEasterEgg();
   const myRecent = allGames
     .filter(g => g.playerTag === profile.tag && g.isMoonShot === Boolean(game.moon))
     .slice(0, 10)
@@ -1004,11 +1317,27 @@ function showResult() {
   const predictionResult = game.mode === 'daily' ? game.predictionMatched
     ? '<div class="prediction-win">Exact Prediction Match! +5 Bonus Coins</div>'
     : `<p class="prediction-summary">Predicted: ${Number(game.predictedScore)} | Actual: ${Number(game.finalTotalScore ?? game.total)}</p>` : '';
+  const is1v1 = game.mode === '1v1';
+  const handsDone = Number(game.handsCompleted1v1 || 0);
+  const more1v1 = is1v1 && handsDone > 0 && handsDone < 4;
+  const replayLabel = is1v1
+    ? (more1v1 ? `Play Hand ${handsDone + 1}/4` : '1v1 Hands Complete (4/4)')
+    : 'Replay';
+
   box.innerHTML = `<div class="felt result-card" style="text-align:center"><h3>Total: ${game.finalTotalScore ?? game.total} points ${goal}</h3>
     ${predictionResult}
+    ${is1v1 ? `<p>⚔️ 1v1 Progress: <b>${handsDone}/4 Hands Played</b>${game.effective1v1Label ? `<br><small>${escapeHTML(game.effective1v1Label)}</small>` : ''}</p>` : ''}
     ${game.mode === 'daily' ? `<p>Coins: ${game.delta >= 0 ? '+' : ''}${game.delta}${game.total >= 51 && !game.moon ? ' · Pot share settles at midnight' : ''}</p>` : ''}
-    <div class="row"><button class="btn" id="replay" style="flex:1">Replay</button><button class="btn" id="back" style="flex:1">Back to Home</button></div></div>`;
-  box.querySelector('#replay').onclick = () => startGame(game.mode === 'daily' ? 'free' : game.mode, false, null);
+    <div class="row"><button class="btn" id="replay" style="flex:1" ${is1v1 && !more1v1 ? 'disabled' : ''}>${replayLabel}</button><button class="btn" id="back" style="flex:1">Back to Home</button></div></div>`;
+  box.querySelector('#replay').onclick = () => {
+    if (is1v1) {
+      if (!more1v1) return;
+      active1v1Id = game.challengeId || active1v1Id;
+      startGame('1v1', Boolean(game.isMoonBattle1v1), null, Boolean(game.isMoonBattle1v1));
+    } else {
+      startGame(game.mode === 'daily' ? 'free' : game.mode, false, null);
+    }
+  };
   box.querySelector('#back').onclick = () => { game = null; save('cotd_game', null); render(); };
 }
 
@@ -1048,7 +1377,11 @@ function showRules() {
     <li>Hand flush: 4 (5 with matching Cut)</li><li>Crib flush: only all 5 cards, 5 points</li><li>His Nobs: Jack matching Cut suit, +1</li><li>His Heels: Cut Card is a Jack, +2 to Crib</li></ul>
     <h3>Crib of the Day Payouts</h3><p>Entry 1 Coin (+1 to the Daily Pot, starts at 10).<br>0–10: +10 · 11–20: −5 · 21–25: −2 · 26–30: −1 · 31–40: 0 · 41–45: +1 · 46–50: +5<br>
     51–55: split Pot 1 (40%) · 56+: split Pot 2 (60%), min 6 Coins each. Exact guess: +5 Coins.</p>
-    <h3>Shooting the Moon</h3><p>Toggle before the 7th slot is filled. Goal: ≤10 points. Daily: ≤10 = +10 Coins, otherwise −5. A 0 enters the Hall of Fame.</p>`);
+    <h3>Shooting the Moon</h3><p>Toggle anytime before placing the first card in Row 3 (9th slot). Goal: ≤10 points. Daily: ≤10 = +10 Coins, otherwise −5. A 0 enters the Hall of Fame.</p>
+<h3>1v1 Arena (Best 3 of 4)</h3><p>2-Coin pay-in per player (max 1 match per opponent per day). Each player plays 4 hands; your top 3 scores are averaged. Winner gets their 2 Coins back plus the rounded-down average lead.<br>
+<b>🌙 Moon 1v1 Toggle:</b> Challenge someone to a dedicated Shoot the Moon battle where the <b>lowest</b> 3-of-4 average wins.<br>
+<b>Standard 1v1 Moon Gamble:</b> Toggle Shoot the Moon during a standard 1v1 hand—if you hit ≤10, it counts as <b>55 pts</b>! If you miss, it counts as your regular score, and if it is your dropped lowest hand, you take a <b>−2 pt</b> penalty on your 3-hand average.<br>
+Matches not completed within 24 hours forfeit automatically with a full 2-Coin refund and no stat impact.</p>`);
 }
 
 function stats(scores, isMoon = false) {
@@ -1165,7 +1498,19 @@ ${(() => {
       return `<div class="pot-banner" style="font-size:13px;">
         <span>⚔️ Your 1v1 Record: <b>${wins.length}W – ${losses.length}L</b></span>
         <strong>${netCoins >= 0 ? '+' : ''}${netCoins} Coins</strong>
-      </div>`;
+      </div>
+      <section class="stats-summary-card" style="margin-top:8px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:6px;">
+          <h4 style="margin:0; color:#f3d27a;">Your 1v1 Match History</h4>
+          <div class="pill-tabs sub" id="sort-1v1-tabs" style="margin:0;">
+            <button class="tab-pill active" data-s1v1="newest">Newest</button>
+            <button class="tab-pill" data-s1v1="oldest">Oldest</button>
+            <button class="tab-pill" data-s1v1="highest">Highest</button>
+            <button class="tab-pill" data-s1v1="lowest">Lowest</button>
+          </div>
+        </div>
+        <div id="history-1v1-boxes" style="max-height:240px; overflow-y:auto; margin-top:8px;"></div>
+      </section>`;
     })()}
     <section class="stats-summary-card">
       <div class="pill-tabs" id="dataset-tabs">
@@ -1279,7 +1624,59 @@ ${(() => {
     m.querySelector('#pout').textContent = `Z=${z.toFixed(2)} · P(≥X)=${(100 * (1 - phi(z))).toFixed(1)}% · P(≤X)=${(100 * phi(z)).toFixed(1)}%`;
   };
 
-  renderPersonalStats();
+ renderPersonalStats();
+
+  let sort1v1Mode = 'newest';
+  const render1v1HistoryBoxes = () => {
+    const boxWrap = m.querySelector('#history-1v1-boxes');
+    if (!boxWrap) return;
+    const items = allChallenges
+      .filter(c => c.status === 'completed' && (c.challenger_tag === profile.tag || c.opponent_tag === profile.tag))
+      .map(c => {
+        const isChallenger = String(c.challenger_tag).toUpperCase() === profile.tag;
+        const rival = isChallenger ? c.opponent_tag : c.challenger_tag;
+        const myScores = Array.isArray(isChallenger ? c.challenger_scores : c.opponent_scores)
+          ? (isChallenger ? c.challenger_scores : c.opponent_scores)
+          : [];
+        const theirScores = Array.isArray(isChallenger ? c.opponent_scores : c.challenger_scores)
+          ? (isChallenger ? c.opponent_scores : c.challenger_scores)
+          : [];
+        const isMoon1v1 = Boolean(c.is_moon_battle);
+        const myTop3 = top3Total1v1(myScores, isMoon1v1);
+        const theirTop3 = top3Total1v1(theirScores, isMoon1v1);
+        return { c, rival, isMoon1v1, myTop3, theirTop3, ts: new Date(c.created_at).getTime() || 0 };
+      });
+
+    if (sort1v1Mode === 'newest') items.sort((a, b) => b.ts - a.ts);
+    else if (sort1v1Mode === 'oldest') items.sort((a, b) => a.ts - b.ts);
+    else if (sort1v1Mode === 'highest') items.sort((a, b) => b.myTop3 - a.myTop3);
+    else if (sort1v1Mode === 'lowest') items.sort((a, b) => a.myTop3 - b.myTop3);
+
+    boxWrap.innerHTML = items.map(({ c, rival, isMoon1v1, myTop3, theirTop3 }) => {
+      const margin = Number(c.coins_won || 0);
+      const won = c.winner_tag === profile.tag;
+      const tie = c.winner_tag === 'TIE';
+      const outcome = tie ? 'TIE (2🪙 returned)' : (won ? `WON by ${margin} (+${margin}🪙)` : `LOST by ${margin} (−${margin}🪙)`);
+      const color = tie ? '#f3d27a' : (won ? '#7ee787' : '#ff8b8b');
+      return `<div class="row" style="padding:8px; border:1px solid rgba(255,255,255,.2); border-radius:8px; background:rgba(0,0,0,.28); margin:5px 0; gap:8px;">
+        <div style="font-size:12px; flex:1;">
+          <b>vs ${escapeHTML(rival)}</b> · ${isMoon1v1 ? '🌙 Moon' : '⚔️ Regular'} · <span style="opacity:.75;">${escapeHTML(c.date_key)}</span><br>
+          <span style="color:${color}; font-weight:700;">${outcome}</span>
+        </div>
+        <div style="text-align:right; font-size:12px; padding:4px 8px; border-radius:6px; background:rgba(243,210,122,.1);">
+          <div style="font-size:10px; opacity:.8;">TOP-3 SCORE</div>
+          <b>You ${myTop3}</b> vs <b>${theirTop3}</b>
+        </div>
+      </div>`;
+    }).join('') || '<p class="empty-note">No completed 1v1 matches yet.</p>';
+  };
+
+  m.querySelectorAll('#sort-1v1-tabs .tab-pill').forEach(btn => btn.onclick = () => {
+    sort1v1Mode = btn.getAttribute('data-s1v1');
+    m.querySelectorAll('#sort-1v1-tabs .tab-pill').forEach(b => b.classList.toggle('active', b === btn));
+    render1v1HistoryBoxes();
+  });
+  render1v1HistoryBoxes();
 
   m.querySelectorAll('[data-view-game]').forEach(button => button.onclick = () => viewHand(allGames.find(g => String(g.id) === button.dataset.viewGame)));
   m.querySelectorAll('[data-champ]').forEach(button => button.onclick = () => {
