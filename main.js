@@ -765,7 +765,7 @@ function showOnboardingTutorial() {
       title: 'Ways to Play & Settings',
       body: `
         <ul style="margin:8px 0; padding-left:18px; line-height:1.55;">
-          <li><b>Crib of the Day (1 Coin):</b> Everyone plays the exact same deck each day. Call your exact score beforehand for <b>+5 bonus Coins</b>, and score 41+ (or ≤10 in <i>Shoot the Moon</i>) to win Coins!</li>
+          <li><b>Crib of the Day (1 Coin):</b> Play your daily ranked hand! Call your exact score beforehand for <b>+5 bonus Coins</b>, and score 41+ (or ≤10 in <i>Shoot the Moon</i>) to win Coins!</li>
           <li><b>⚔️ 1v1 Arena (2 Coins):</b> Challenge another player to a <b>Best 3 of 4 hands</b> match and win Coins equal to your average score lead.</li>
           <li><b>Free Play:</b> Unlimited practice hands anytime for 0 Coins.</li>
           <li><b>Settings &amp; Rules (⚙ / ?):</b> Tap the gear icon in the top-right corner anytime to toggle music, sound effects, Quick Play, scoring explanations, or animation speed—and tap <b>?</b> to revisit the rules.</li>
@@ -1219,7 +1219,7 @@ async function startGame(mode, moon, predictedScore, isMoonBattle = false, isSab
       }
     }
   }
-  const deck = makeDeck(mode === 'daily' ? `cotd-${todayKey()}` : '', excluded);
+  const deck = makeDeck('', excluded);
   const forceMoon = mode === '1v1' && Boolean(isMoonBattle);
   const disableMoon = mode === '1v1' && Boolean(isSabotage);
   game = {
