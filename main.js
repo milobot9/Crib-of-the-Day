@@ -16,7 +16,6 @@ const playlist = [
   'assets/audio/lounge-music8.mp3',
   'assets/audio/lounge-music9.mp3',
   'assets/audio/lounge-music10.mp3',
-  'assets/audio/lounge-music11.mp3',
   'assets/audio/lounge-music12.mp3',
   'assets/audio/lounge-music13.mp3',
   'assets/audio/lounge-music14.mp3',
@@ -1619,22 +1618,23 @@ function showResult() {
         <div style="display:flex; gap:6px; flex-wrap:wrap; margin-bottom:10px;">
           ${[0, 1, 2, 3].map(c => `<button type="button" class="btn small ${shieldChoice?.type === 'col' && shieldChoice.idx === c ? 'gold-btn' : ''}" data-sh-type="col" data-sh-idx="${c}">Hand ${c + 1}</button>`).join('')}
         </div>
-        ${shieldChoice ? `<div style="font-size:12px; color:#7cc4ff; margin-bottom:10px;">🛡️ Shielded: <b>${shieldCards.map(formatCardText).join(', ')}</b></div>` : ''}
+        ${shieldChoice ? `<div class="neon-shield-banner">🛡️ <span>SHIELDED:</span> ${shieldCards.map(c => `<span class="neon-card-chip ${c.s === 1 || c.s === 2 ? 'red' : 'blk'}">${formatCardText(c)}</span>`).join(' ')}</div>` : ''}
 
         <h3 style="margin:6px 0 4px; color:#f3d27a;">2. Burn ${cfg.burn} of ${cfg.pool} Rival Cards &amp; Expose ${cfg.chooseReveal}</h3>
         <p style="font-size:12px; margin:0 0 8px; opacity:.9;">
           Tap <b>${cfg.burn}</b> cards to burn (${burnSelection.length}/${cfg.burn}), then tap <b>👁️</b> on <b>${cfg.chooseReveal}</b> to expose (${revealSelection.length}/${cfg.chooseReveal})${cfg.randomReveal ? ` + <b>${cfg.randomReveal} random</b> leaks` : ''}.
         </p>
-        <div class="sab-pool">
+        <div class="sab-pool" style="display:grid; grid-template-columns:repeat(4, 1fr); gap:10px; margin:10px 0;">
           ${game.sabotagePool.map((c, idx) => {
             const isBurned = burnSelection.includes(idx);
             const isExposed = revealSelection.includes(idx);
             const red = c.s === 1 || c.s === 2;
-            return `<div class="sab-slot">
-              <div class="card ${red ? 'red' : 'blk'} ${isBurned ? 'sab-burn' : ''}" data-sab-card="${idx}">
-                <span class="r">${RANKS[c.r - 1]}</span><span class="s">${SUITS[c.s]}</span>
+            return `<div class="sab-slot" style="display:flex; flex-direction:column; align-items:center;">
+              <div class="card ${red ? 'red' : 'blk'} ${isBurned ? 'sab-burn' : ''}" data-sab-card="${idx}" style="width:100%; height:104px; cursor:pointer; position:relative; background:#fff; border-radius:8px; box-sizing:border-box;">
+                <span class="r" style="font-size:26px; font-weight:800; position:absolute; top:5px; left:8px; line-height:1;">${RANKS[c.r - 1]}</span>
+                <span class="s" style="font-size:28px; position:absolute; bottom:5px; right:8px; line-height:1;">${SUITS[c.s]}</span>
               </div>
-              ${isBurned ? `<button type="button" class="btn small ${isExposed ? 'gold-btn' : ''}" data-sab-eye="${idx}" style="margin-top:6px; padding:4px 8px; min-height:30px; font-size:12px; width:100%;">${isExposed ? '👁️ Shown' : '🙈 Hide'}</button>` : '<div style="height:36px;"></div>'}
+              ${isBurned ? `<button type="button" class="btn small ${isExposed ? 'gold-btn' : ''}" data-sab-eye="${idx}" style="margin-top:6px; padding:4px 6px; min-height:32px; font-size:12px; width:100%;">${isExposed ? '👁️ Shown' : '🙈 Hide'}</button>` : '<div style="height:38px;"></div>'}
             </div>`;
           }).join('')}
         </div>

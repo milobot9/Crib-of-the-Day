@@ -908,11 +908,47 @@ html, body {
     overflow: visible !important;
     margin: 0 auto;
 }
-/* Sabotage 1v1 Draft & Secret Shield Highlights */
+/* Sabotage 1v1 Draft & Neon Red Shield Highlights */
 .cell.shield-hl {
-  outline: 2px solid #58a6ff;
-  box-shadow: 0 0 12px rgba(88, 166, 255, 0.85);
+  outline: 3px solid #ff1e42;
+  box-shadow: 0 0 16px #ff1e42, inset 0 0 10px rgba(255, 30, 66, 0.65);
   border-radius: 8px;
+}
+
+.neon-shield-banner {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 8px 0 12px;
+  padding: 9px 11px;
+  border-radius: 10px;
+  background: rgba(34, 4, 10, 0.94);
+  border: 2px solid #ff1e42;
+  box-shadow: 0 0 16px rgba(255, 30, 66, 0.8), inset 0 0 10px rgba(255, 30, 66, 0.3);
+  color: #ff6b81;
+  font-size: 13px;
+  font-weight: 800;
+  text-shadow: 0 0 8px rgba(255, 30, 66, 0.9);
+}
+
+.neon-card-chip {
+  display: inline-block;
+  background: #ffffff;
+  padding: 2px 7px;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 900;
+  text-shadow: none;
+  box-shadow: 0 0 8px #ff1e42;
+}
+
+.neon-card-chip.red {
+  color: #dc2626;
+}
+
+.neon-card-chip.blk {
+  color: #111827;
 }
 
 .sab-pool {
@@ -930,26 +966,12 @@ html, body {
 
 .sab-slot .card {
   width: 100%;
-  aspect-ratio: 5 / 7;
-  height: auto;
-  min-height: 92px;
+  height: 104px;
   cursor: pointer;
 }
 
-.sab-slot .card .r {
-  font-size: 26px;
-  top: 6px;
-  left: 8px;
-}
-
-.sab-slot .card .s {
-  font-size: 28px;
-  bottom: 6px;
-  right: 8px;
-}
-
 .card.sab-burn {
-  outline: 3px solid #ff5c5c;
-  box-shadow: 0 0 14px rgba(255, 92, 92, 0.9);
+  outline: 3px solid #ffbe0b;
+  box-shadow: 0 0 16px rgba(255, 190, 11, 0.95);
   transform: translateY(-3px);
 }
