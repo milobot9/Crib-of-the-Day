@@ -364,6 +364,105 @@ async function expireStale1v1Challenges() {
     if (data) allChallenges = data;
   }
 }
+const SABOTAGE_ROUNDS = {
+  1: { pool: 4, burn: 2, reveal: 1, chooseReveal: 1, randomReveal: 0 },
+  2: { pool: 6, burn: 4, reveal: 2, chooseReveal: 1, randomReveal: 1 },
+  3: { pool: 8, burn: 6, reveal: 3, chooseReveal: 2, randomReveal: 1 },
+};
+
+function isSabotageMatch(c) {
+  return c?.scoring_rule === 'sabotage_4';
+}
+
+function defaultSabotageState() {
+  return {
+    cBurned: [],
+    oBurned: [],
+    cKnown: [],
+    oKnown: [],
+    cSavedLast: [],
+    oSavedLast: [],
+    cPending: null,
+    oPending: null,
+  };
+}
+
+function sumAllHands1v1(entries) {
+  return (Array.isArray(entries) ? entries : [])
+    .slice(0, 4)
+    .map(item => (typeof item === 'object' && item !== null ? Number(item.score) : Number(item)))
+    .filter(Number.isFinite)
+    .reduce((sum, x) => sum + x, 0);
+}
+
+function resolveSabotageRound(state, roundNum) {
+  const cfg = SABOTAGE_ROUNDS[roundNum];
+  if (!cfg || !state.cPending || !state.oPending) return state;
+
+  const applyAttack = (attack, victimShield, existingBurned, existingKnown) => {
+    const shieldSet = new Set((victimShield || []).map(cardKey));
+    const burnedSet = new Set((existingBurned || []).map(cardKey));
+    const knownSet = new Set((existingKnown || []).map(cardKey));
+
+    const saved = [];
+    const actualBurned = [];
+    for (const c of (attack.burn || [])) {
+      const k = cardKey(c);
+      if (shieldSet.has(k)) {
+        saved.push(c);
+      } else if (!burnedSet.has(k)) {
+        burnedSet.add(k);
+        actualBurned.push(c);
+      }
+    }
+
+    const chosenSet = new Set((attack.chosenReveal || []).map(cardKey));
+    const revealedThisTurn = [];
+    const unchosenActual = [];
+
+    for (const c of actualBurned) {
+      if (chosenSet.has(cardKey(c))) revealedThisTurn.push(c);
+      else unchosenActual.push(c);
+    }
+
+    // Forced random reveal(s) from unchosen actual burns (or fallback if chosen burns were shielded)
+    const neededRandom = Math.max(0, Math.min(actualBurned.length - revealedThisTurn.length, cfg.randomReveal));
+    const pool = [...unchosenActual];
+    for (let i = pool.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [pool[i], pool[j]] = [pool[j], pool[i]];
+    }
+    for (let i = 0; i < neededRandom && pool.length > 0; i++) {
+      revealedThisTurn.push(pool.shift());
+    }
+
+    const nextBurned = [...(existingBurned || []), ...actualBurned];
+    const nextKnown = [...(existingKnown || [])];
+    for (const c of revealedThisTurn) {
+      if (!knownSet.has(cardKey(c))) {
+        knownSet.add(cardKey(c));
+        nextKnown.push(c);
+      }
+    }
+
+    return { nextBurned, nextKnown, saved };
+  };
+
+  // Challenger attacks Opponent; Opponent attacks Challenger
+  const oppRes = applyAttack(state.cPending, state.oPending.shield, state.oBurned, state.oKnown);
+  const chalRes = applyAttack(state.oPending, state.cPending.shield, state.cBurned, state.cKnown);
+
+  return {
+    cBurned: chalRes.nextBurned,
+    oBurned: oppRes.nextBurned,
+    cKnown: chalRes.nextKnown,
+    oKnown: oppRes.nextKnown,
+    cSavedLast: chalRes.saved,
+    oSavedLast: oppRes.saved,
+   cPending: null,
+    oPending: null,
+  };
+}
 
 // Grand total of top 3 hands (lowest 3 for Moon Battle, highest 3 for Standard)
 function top3Total1v1(entries, isMoonBattle = false) {
@@ -467,12 +566,20 @@ function rng(seed) {
   };
 }
 
-function makeDeck(seedStr) {
+const cardKey = c => `${c.r}-${c.s}`;
+const formatCardText = c => `${RANKS[c.r - 1]}${SUITS[c.s]}`;
+
+function makeDeck(seedStr, excludedCards = []) {
   let h = 7;
   for (const c of seedStr) h = Math.imul(h ^ c.charCodeAt(0), 2654435761);
   const rand = seedStr ? rng(h) : Math.random;
+  const blocked = new Set((excludedCards || []).map(cardKey));
   const deck = [];
-  for (let s = 0; s < 4; s++) for (let r = 1; r <= 13; r++) deck.push({ r, s });
+  for (let s = 0; s < 4; s++) {
+    for (let r = 1; r <= 13; r++) {
+      if (!blocked.has(`${r}-${s}`)) deck.push({ r, s });
+    }
+  }
   for (let i = deck.length - 1; i > 0; i--) {
     const j = Math.floor(rand() * (i + 1));
     [deck[i], deck[j]] = [deck[j], deck[i]];
@@ -738,7 +845,7 @@ function renderHome() {
     return myScores.length < 4;
   }).length;
 
-  const inboxHTML = activeToday.map(c => {
+const inboxHTML = activeToday.map(c => {
     const isChallenger = String(c.challenger_tag).toUpperCase() === profile.tag;
     const rival = isChallenger ? c.opponent_tag : c.challenger_tag;
     const myScores = Array.isArray(isChallenger ? c.challenger_scores : c.opponent_scores)
@@ -747,24 +854,42 @@ function renderHome() {
     const theirScores = Array.isArray(isChallenger ? c.opponent_scores : c.challenger_scores)
       ? (isChallenger ? c.opponent_scores : c.challenger_scores)
       : [];
-    const myDone = myScores.length >= 4;
     const stake = Number(c.stake || 2);
+    const isSab = isSabotageMatch(c);
     const isMoon1v1 = Boolean(c.is_moon_battle);
-    const myTop3 = top3Total1v1(myScores, isMoon1v1);
-    const theirTop3 = top3Total1v1(theirScores, isMoon1v1);
+    const sab = c.sabotage_state || defaultSabotageState();
+    const myPending = isChallenger ? sab.cPending : sab.oPending;
+    const theirPending = isChallenger ? sab.oPending : sab.cPending;
+
+    const needsMyDraft = isSab && myScores.length >= 1 && myScores.length <= 3 && !myPending
+      && (myScores.length > theirScores.length || Boolean(theirPending));
+    const waitingOnRivalDraft = isSab && !needsMyDraft && myScores.length < 4 && (
+      Boolean(myPending) || (myScores.length > theirScores.length)
+    );
+
+    const myDone = myScores.length >= 4 || waitingOnRivalDraft;
+    const myDisplayScore = isSab ? sumAllHands1v1(myScores) : top3Total1v1(myScores, isMoon1v1);
+    const theirDisplayScore = isSab ? sumAllHands1v1(theirScores) : top3Total1v1(theirScores, isMoon1v1);
     const needsAccept = !isChallenger && c.status === 'pending' && myScores.length === 0;
-    const actionLabel = myDone
-      ? `Waiting (${theirScores.length}/4)`
-      : (needsAccept ? `Accept & Play (${stake}🪙)` : `Play Hand ${myScores.length + 1}/4`);
+
+    let actionLabel;
+    if (myScores.length >= 4) actionLabel = `Waiting (${theirScores.length}/4)`;
+    else if (needsMyDraft) actionLabel = `🔥 Sabotage Round ${myScores.length}`;
+    else if (waitingOnRivalDraft) actionLabel = `Waiting on Rival…`;
+    else if (needsAccept) actionLabel = `Accept & Play (${stake}🪙)`;
+    else actionLabel = `Play Hand ${myScores.length + 1}/4`;
+
+    const modeBadge = isSab ? '🔥 Sabotage' : (isMoon1v1 ? '🌙 Moon' : '⚔️ Regular');
+    const scoreHeader = isSab ? '4-HAND TOTAL' : 'TOP-3 SCORE';
 
     return `<div class="row" style="padding:8px; border:1px solid rgba(243,210,122,.4); border-radius:8px; background:rgba(0,0,0,.25); margin:6px 0; gap:8px;">
       <div style="font-size:12px; flex:1;">
-        <b>vs ${escapeHTML(rival)}</b> · ${isMoon1v1 ? '🌙 Moon' : '⚔️ Regular'} · ${stake}🪙<br>
+        <b>vs ${escapeHTML(rival)}</b> · ${modeBadge} · ${stake}🪙<br>
         <span style="opacity:.85;">Hands: You ${myScores.length}/4 · Them ${theirScores.length}/4</span>
       </div>
       <div style="text-align:right; font-size:12px; padding:4px 8px; border-radius:6px; background:rgba(243,210,122,.12); border:1px solid rgba(243,210,122,.35);">
-        <div style="font-size:10px; opacity:.8;">TOP-3 SCORE</div>
-        <b>You ${myTop3}</b> vs <b>${theirTop3}</b>
+        <div style="font-size:10px; opacity:.8;">${scoreHeader}</div>
+        <b>You ${myDisplayScore}</b> vs <b>${theirDisplayScore}</b>
       </div>
       <button class="btn small gold-btn" data-play-1v1="${escapeHTML(c.id)}" ${myDone ? 'disabled' : ''}>${actionLabel}</button>
     </div>`;
@@ -779,9 +904,10 @@ function renderHome() {
     const theirScores = Array.isArray(isChallenger ? c.opponent_scores : c.challenger_scores)
       ? (isChallenger ? c.opponent_scores : c.challenger_scores)
       : [];
+    const isSab = isSabotageMatch(c);
     const isMoon1v1 = Boolean(c.is_moon_battle);
-    const myTop3 = top3Total1v1(myScores, isMoon1v1);
-    const theirTop3 = top3Total1v1(theirScores, isMoon1v1);
+    const myTop3 = isSab ? sumAllHands1v1(myScores) : top3Total1v1(myScores, isMoon1v1);
+    const theirTop3 = isSab ? sumAllHands1v1(theirScores) : top3Total1v1(theirScores, isMoon1v1);
     const margin = Number(c.coins_won || 0);
     const won = c.winner_tag === profile.tag;
     const tie = c.winner_tag === 'TIE';
@@ -792,11 +918,11 @@ function renderHome() {
 
     return `<div class="row" style="padding:8px; border:1px solid rgba(255,255,255,.22); border-radius:8px; background:rgba(0,0,0,.3); margin:6px 0; gap:8px;">
       <div style="font-size:12px; flex:1;">
-        <b>vs ${escapeHTML(rival)}</b> · ${isMoon1v1 ? '🌙 Moon' : '⚔️ Regular'}<br>
+        <b>vs ${escapeHTML(rival)}</b> · ${isSab ? '🔥 Sabotage' : (isMoon1v1 ? '🌙 Moon' : '⚔️ Regular')}<br>
         <span style="color:${badgeColor}; font-weight:700;">${outcomeText}</span>
       </div>
       <div style="text-align:right; font-size:12px; padding:4px 8px; border-radius:6px; background:rgba(255,255,255,.08);">
-        <div style="font-size:10px; opacity:.8;">FINAL TOP-3</div>
+        <div style="font-size:10px; opacity:.8;">${isSab ? 'FINAL 4-HAND' : 'FINAL TOP-3'}</div>
         <b>You ${myTop3}</b> vs <b>${theirTop3}</b>
       </div>
     </div>`;
@@ -821,8 +947,24 @@ function renderHome() {
     </div>
 
     <div id="hub-1v1" style="display:${pendingCount ? 'block' : 'none'}; margin-top:8px; padding:12px; border:1px solid #f3d27a; border-radius:10px; background:rgba(0,0,0,.35);">
-      <div class="eyebrow">1V1 ARENA · TOP 3 OF 4 HANDS · 2 COIN PAY-IN</div>
-      <p style="margin:4px 0 8px; font-size:12px;">Challenge each rival up to once in <b>Regular</b> and once in <b>Shoot the Moon</b> per day (2🪙 each). Matches reset at midnight—unfinished games forfeit with a full 2-Coin refund.</p>
+      <div style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
+        <div class="eyebrow">1V1 ARENA · 2 COIN PAY-IN</div>
+        <button class="btn small" id="toggle-sabotage-help" type="button" style="font-size:11px; padding:3px 8px;">🔥 How Sabotage Works</button>
+      </div>
+      <div id="sabotage-help-bar" style="display:none; margin:8px 0; padding:10px; border-radius:8px; border:1px solid rgba(255,107,107,.45); background:rgba(20,8,8,.55); font-size:12px; line-height:1.45;">
+        <div style="font-weight:700; color:#f3d27a; margin-bottom:4px;">🔥 Sabotage 1v1 Rules (4-Hand Cumulative · No Moon)</div>
+        <ul style="margin:0; padding-left:16px;">
+          <li><b>1. Play 4 Hands:</b> Highest <b>4-hand total</b> wins (payout = <code>⌊lead ÷ 4⌋</code> Coins). Shoot the Moon is disabled.</li>
+          <li><b>2. Secret Shield (After Hands 1–3):</b> Pick <b>1 Row (5 cards, incl. Crib)</b> or <b>1 Column (4 cards)</b> on your finished board. If your rival tries to burn those cards, the burn fizzles!</li>
+          <li><b>3. Escalating Burn &amp; Fog of War:</b>
+            <br>• After Hand 1: Burn <b>2 of 4</b> rival cards → pick <b>1</b> to show (1 hidden).
+            <br>• After Hand 2: Burn <b>4 of 6</b> rival cards → pick <b>1</b> to show + <b>1 random</b> leaks (2 hidden).
+            <br>• After Hand 3: Burn <b>6 of 8</b> rival cards → pick <b>2</b> to show + <b>1 random</b> leaks (3 hidden).
+          </li>
+          <li><b>4. Permanent Deck Rot:</b> Unshielded burned cards stay gone for the rest of the match (down to 40/52 cards in Hand 4).</li>
+        </ul>
+      </div>
+      <p style="margin:4px 0 8px; font-size:12px;">Challenge each rival up to once in <b>Regular</b>, <b>Moon</b>, and <b>Sabotage</b> per day (2🪙 each). Matches reset at midnight—unfinished games forfeit with a full 2-Coin refund.</p>
       <div class="compare-search-row">
         <input type="search" id="home-1v1-search" placeholder="Tag (ACE#1) or Initials (ACE)" autocomplete="off">
         <button class="btn small" id="home-1v1-find" type="button">Find</button>
@@ -848,7 +990,7 @@ function renderHome() {
   main.querySelector('#free').onclick = () => startGame('free', moonBox.checked, null);
   main.querySelector('#lb').onclick = showBoards;
 
-  const hub1v1 = main.querySelector('#hub-1v1');
+ const hub1v1 = main.querySelector('#hub-1v1');
   main.querySelector('#toggle-1v1').onclick = async () => {
     const opening = hub1v1.style.display !== 'block';
     hub1v1.style.display = opening ? 'block' : 'none';
@@ -858,6 +1000,11 @@ function renderHome() {
       const reopened = root.querySelector('#hub-1v1');
       if (reopened) reopened.style.display = 'block';
     }
+  };
+
+  const sabHelpBar = main.querySelector('#sabotage-help-bar');
+  main.querySelector('#toggle-sabotage-help').onclick = () => {
+    sabHelpBar.style.display = sabHelpBar.style.display === 'block' ? 'none' : 'block';
   };
 
   const search1v1 = main.querySelector('#home-1v1-search');
@@ -876,25 +1023,31 @@ function renderHome() {
     const list = (data ?? []).filter(p => p.tag !== profile.tag);
     if (!list.length) { matches1v1.innerHTML = '<p style="font-size:12px;">No matching players found.</p>'; return; }
     matches1v1.innerHTML = list.map(p => `
-      <div class="row" style="padding:6px 8px; margin:4px 0; border-radius:8px; background:rgba(255,255,255,.06); gap:6px;">
+      <div class="row" style="padding:6px 8px; margin:4px 0; border-radius:8px; background:rgba(255,255,255,.06); gap:6px; flex-wrap:wrap;">
         <b style="font-size:13px;">${escapeHTML(p.tag)}</b>
-        <div style="display:flex; gap:6px;">
-          <button class="btn small gold-btn" data-send-rival="${escapeHTML(p.tag)}" data-send-moon="0">⚔️ Regular (2🪙)</button>
-          <button class="btn small" data-send-rival="${escapeHTML(p.tag)}" data-send-moon="1">🌙 Moon (2🪙)</button>
+        <div style="display:flex; gap:5px; flex-wrap:wrap;">
+          <button class="btn small gold-btn" data-send-rival="${escapeHTML(p.tag)}" data-send-type="regular">⚔️ Regular (2🪙)</button>
+          <button class="btn small" data-send-rival="${escapeHTML(p.tag)}" data-send-type="moon">🌙 Moon (2🪙)</button>
+          <button class="btn small" data-send-rival="${escapeHTML(p.tag)}" data-send-type="sabotage">🔥 Sabotage (2🪙)</button>
         </div>
       </div>`).join('');
 
     matches1v1.querySelectorAll('[data-send-rival]').forEach(btn => btn.onclick = async () => {
       const rival = btn.getAttribute('data-send-rival');
-      const isMoonBattle = btn.getAttribute('data-send-moon') === '1';
-      const modeLabel = isMoonBattle ? 'Shoot the Moon' : 'Regular';
-      const alreadyToday = allChallenges.some(c =>
-        c.date_key === todayKey() &&
-        c.status !== 'expired' &&
-        Boolean(c.is_moon_battle) === isMoonBattle &&
-        ((c.challenger_tag === profile.tag && c.opponent_tag === rival) ||
-         (c.challenger_tag === rival && c.opponent_tag === profile.tag))
-      );
+      const sendType = btn.getAttribute('data-send-type');
+      const isMoonBattle = sendType === 'moon';
+      const isSabotage = sendType === 'sabotage';
+      const ruleKey = isSabotage ? 'sabotage_4' : (isMoonBattle ? 'moon_best_3_of_4' : 'best_3_of_4');
+      const modeLabel = isSabotage ? 'Sabotage' : (isMoonBattle ? 'Shoot the Moon' : 'Regular');
+
+      const alreadyToday = allChallenges.some(c => {
+        if (c.date_key !== todayKey() || c.status === 'expired') return false;
+        const samePair = (c.challenger_tag === profile.tag && c.opponent_tag === rival)
+          || (c.challenger_tag === rival && c.opponent_tag === profile.tag);
+        if (!samePair) return false;
+        const cRule = c.scoring_rule || (c.is_moon_battle ? 'moon_best_3_of_4' : 'best_3_of_4');
+        return cRule === ruleKey;
+      });
       if (alreadyToday) { msg1v1.textContent = `You already have a ${modeLabel} 1v1 with ${rival} today.`; return; }
       if (Number(profile.coins) < 2) { msg1v1.textContent = 'You need at least 2 Coins to send a 1v1.'; return; }
       btn.disabled = true;
@@ -906,14 +1059,15 @@ function renderHome() {
         date_key: todayKey(),
         stake: 2,
         is_moon_battle: isMoonBattle,
-        scoring_rule: isMoonBattle ? 'moon_best_3_of_4' : 'best_3_of_4',
+        scoring_rule: ruleKey,
         status: 'pending',
         challenger_scores: [],
         opponent_scores: [],
+        sabotage_state: isSabotage ? defaultSabotageState() : null,
       }).select('*').single();
       if (error || !created) {
         logSupabaseError('create 1v1 challenge', error);
-        msg1v1.textContent = `Could not send challenge: ${error?.message || 'Check SQL setup.'}`;
+        msg1v1.textContent = `Could not send challenge: ${error?.message || 'Run the sabotage_state SQL update first.'}`;
         btn.disabled = false;
         btn.textContent = prevText;
         return;
@@ -921,9 +1075,8 @@ function renderHome() {
       await changeCoins(-2);
       allChallenges = [created, ...allChallenges];
       active1v1Id = created.id;
-      startGame('1v1', isMoonBattle, null, isMoonBattle);
+      startGame('1v1', isMoonBattle, null, isMoonBattle, isSabotage);
     });
-  };
 
   main.querySelectorAll('[data-play-1v1]').forEach(btn => btn.onclick = async () => {
   const cid = btn.getAttribute('data-play-1v1');
@@ -949,6 +1102,9 @@ function renderHome() {
     const isChallenger = String(ch.challenger_tag).toUpperCase() === profile.tag;
     const myScores = Array.isArray(isChallenger ? ch.challenger_scores : ch.opponent_scores)
       ? (isChallenger ? ch.challenger_scores : ch.opponent_scores)
+      : [];
+    const theirScores = Array.isArray(isChallenger ? ch.opponent_scores : ch.challenger_scores)
+      ? (isChallenger ? ch.opponent_scores : ch.challenger_scores)
       : [];
     if (myScores.length >= 4) {
       await refreshCloudData();
@@ -976,7 +1132,19 @@ function renderHome() {
     }
 
     active1v1Id = ch.id;
-    startGame('1v1', Boolean(ch.is_moon_battle), null, Boolean(ch.is_moon_battle));
+    const isSab = isSabotageMatch(ch);
+    if (isSab) {
+      const sab = ch.sabotage_state || defaultSabotageState();
+      const myPending = isChallenger ? sab.cPending : sab.oPending;
+      const theirPending = isChallenger ? sab.oPending : sab.cPending;
+      const needsDraft = myScores.length >= 1 && myScores.length <= 3 && !myPending
+        && (myScores.length > theirScores.length || Boolean(theirPending));
+      if (needsDraft) {
+        openSabotageResumedDraft(ch);
+        return;
+      }
+    }
+    startGame('1v1', Boolean(ch.is_moon_battle), null, Boolean(ch.is_moon_battle), isSab);
   });
 
   main.querySelector('#daily').onclick = () => {
@@ -1016,15 +1184,25 @@ function renderHome() {
   };
 }
 
-function startGame(mode, moon, predictedScore, isMoonBattle = false) {
-  const deck = makeDeck(mode === 'daily' ? `cotd-${todayKey()}` : '');
+function startGame(mode, moon, predictedScore, isMoonBattle = false, isSabotage = false) {
+  let excluded = [];
+  if (mode === '1v1' && isSabotage && active1v1Id) {
+    const ch = allChallenges.find(x => String(x.id) === String(active1v1Id));
+    if (ch?.sabotage_state) {
+      const isChallenger = String(ch.challenger_tag).toUpperCase() === profile.tag;
+      excluded = isChallenger ? (ch.sabotage_state.cBurned || []) : (ch.sabotage_state.oBurned || []);
+    }
+  }
+  const deck = makeDeck(mode === 'daily' ? `cotd-${todayKey()}` : '', excluded);
   const forceMoon = mode === '1v1' && Boolean(isMoonBattle);
+  const disableMoon = mode === '1v1' && Boolean(isSabotage);
   game = {
     playerTag: profile.tag,
     mode,
     challengeId: mode === '1v1' ? active1v1Id : null,
     isMoonBattle: forceMoon,
-    moon: forceMoon ? true : Boolean(moon),
+    isSabotage1v1: disableMoon,
+    moon: disableMoon ? false : (forceMoon ? true : Boolean(moon)),
     predictedScore: mode === 'daily' ? Number(predictedScore) : null,
     deck,
     grid: Array(16).fill(null),
@@ -1049,6 +1227,7 @@ function getLive1v1BoxHTML() {
   if (!game || game.mode !== '1v1') return '';
   const chId = game.challengeId || active1v1Id;
   const ch = allChallenges.find(x => String(x.id) === String(chId));
+  const isSab = Boolean(isSabotageMatch(ch) || game.isSabotage1v1);
   const isMoon1v1 = Boolean(ch?.is_moon_battle ?? game.isMoonBattle);
   const isChallenger = ch ? String(ch.challenger_tag).toUpperCase() === profile.tag : true;
   const rival = ch ? (isChallenger ? ch.opponent_tag : ch.challenger_tag) : 'Rival';
@@ -1061,22 +1240,48 @@ function getLive1v1BoxHTML() {
 
   const currentHandTotal = game.scores.reduce((a, b) => a + b, 0);
   let currentEntry = currentHandTotal;
-  if (!isMoon1v1 && game.moon && game.done && currentHandTotal <= 10) currentEntry = 55;
+  if (!isSab && !isMoon1v1 && game.moon && game.done && currentHandTotal <= 10) currentEntry = 55;
 
   const mySeries = game.done && game.recordSaved ? prevMy : [...prevMy, currentEntry];
-  const myTop3 = top3Total1v1(mySeries, isMoon1v1);
-  const theirTop3 = top3Total1v1(theirScores, isMoon1v1);
+  const myScore = isSab ? sumAllHands1v1(mySeries) : top3Total1v1(mySeries, isMoon1v1);
+  const theirScore = isSab ? sumAllHands1v1(theirScores) : top3Total1v1(theirScores, isMoon1v1);
   const handNum = Math.min(4, (game.done && game.recordSaved ? prevMy.length : prevMy.length + 1));
 
-  return `<div id="live-1v1-box" class="row" style="margin:6px 0 8px; padding:8px 10px; border:1px solid #f3d27a; border-radius:8px; background:rgba(0,0,0,.35); font-size:12px;">
-    <div>
-      <b>${isMoon1v1 ? '🌙 Moon 1v1' : '⚔️ 1v1'} vs ${escapeHTML(rival)}</b> · Hand ${handNum}/4<br>
-      <span style="opacity:.85;">This hand: ${currentHandTotal} pts</span>
+  let graveyardHTML = '';
+  if (isSab) {
+    const sab = ch?.sabotage_state || defaultSabotageState();
+    const myBurned = isChallenger ? (sab.cBurned || []) : (sab.oBurned || []);
+    const myKnown = isChallenger ? (sab.cKnown || []) : (sab.oKnown || []);
+    const mySaved = isChallenger ? (sab.cSavedLast || []) : (sab.oSavedLast || []);
+    const hiddenCount = Math.max(0, myBurned.length - myKnown.length);
+    const knownList = myKnown.length ? myKnown.map(formatCardText).join(', ') : 'None';
+    const savedNote = mySaved.length
+      ? `<div style="color:#7ee787; margin-top:2px;">🛡️ Shield blocked last turn: <b>${mySaved.map(formatCardText).join(', ')}</b></div>`
+      : '';
+
+    graveyardHTML = `<div style="margin-top:6px; padding-top:6px; border-top:1px solid rgba(255,255,255,.15); font-size:11px; opacity:.95;">
+      🔥 <b>Deck: ${52 - myBurned.length}/52 left</b> · Known Burned: <b>${escapeHTML(knownList)}</b>${hiddenCount ? ` <i>(+${hiddenCount} hidden)</i>` : ''}
+      ${savedNote}
+    </div>`;
+  }
+
+  const modeLabel = isSab
+    ? `🔥 Sabotage 1v1 <button type="button" class="btn small" onclick="document.getElementById('help').click()" style="padding:1px 6px; font-size:10px; margin-left:4px;">?</button>`
+    : (isMoon1v1 ? '🌙 Moon 1v1' : '⚔️ 1v1');
+  const scoreLabel = isSab ? '4-HAND CUMULATIVE' : 'CUMULATIVE TOP-3';
+
+  return `<div id="live-1v1-box" style="margin:6px 0 8px; padding:8px 10px; border:1px solid #f3d27a; border-radius:8px; background:rgba(0,0,0,.35); font-size:12px;">
+    <div class="row" style="margin:0;">
+      <div>
+        <b>${modeLabel} vs ${escapeHTML(rival)}</b> · Hand ${handNum}/4<br>
+        <span style="opacity:.85;">This hand: ${currentHandTotal} pts</span>
+      </div>
+      <div style="text-align:right;">
+        <div style="font-size:10px; opacity:.8;">${scoreLabel}</div>
+        <b style="font-size:14px; color:#f3d27a;">You: ${myScore}</b> · <span>Them: ${theirScore}</span>
+      </div>
     </div>
-    <div style="text-align:right;">
-      <div style="font-size:10px; opacity:.8;">CUMULATIVE TOP-3</div>
-      <b style="font-size:14px; color:#f3d27a;">You: ${myTop3}</b> · <span>Them: ${theirTop3}</span>
-    </div>
+    ${graveyardHTML}
   </div>`;
 }
 
@@ -1084,7 +1289,7 @@ function renderBoard() {
   const main = root.querySelector('#main');
   if (!main) return;
   const n = placed();
-  const moonLocked = game.moon || n >= 8;
+  const moonLocked = game.isSabotage1v1 || game.moon || n >= 8;
   main.innerHTML = `<div class="felt"><div class="trays">
       <div class="tray"><div class="lbl">NEXT CARD</div><div class="slot" id="next"></div></div>
       <div class="tray cut"><div class="lbl">CUT CARD</div><div class="slot" id="cut"></div></div></div>
@@ -1220,16 +1425,17 @@ async function finishGame() {
   if (game.mode === '1v1' && chId) {
     const { data: freshCh } = await supabase.from('challenges_1v1').select('*').eq('id', chId).single();
     if (freshCh && freshCh.status !== 'expired') {
+      const isSab = isSabotageMatch(freshCh);
       const isMoonBattle = Boolean(freshCh.is_moon_battle);
       const isChallenger = String(freshCh.challenger_tag).toUpperCase() === profile.tag;
       const field = isChallenger ? 'challenger_scores' : 'opponent_scores';
       const prevArr = Array.isArray(freshCh[field]) ? freshCh[field] : [];
 
-      // Build recorded entry:
-      // - In designated Moon 1v1: raw score (lowest 3 of 4 wins)
-      // - In Standard 1v1 with Moon toggled ON: <=10 counts as 55; >10 counts as raw score with moonGambleMissed flag
       let entry;
-      if (isMoonBattle) {
+      if (isSab) {
+        entry = score;
+        game.effective1v1Label = `${score} pts (Sabotage Cumulative)`;
+      } else if (isMoonBattle) {
         entry = score;
         game.effective1v1Label = `${score} pts (Moon Battle)`;
       } else if (game.moon) {
@@ -1252,21 +1458,21 @@ async function finishGame() {
       const oScores = isChallenger ? (Array.isArray(freshCh.opponent_scores) ? freshCh.opponent_scores : []) : updatedArr;
 
       if (cScores.length >= 4 && oScores.length >= 4 && freshCh.status !== 'completed') {
-        const cAvg = score1v1Series(cScores, isMoonBattle);
-        const oAvg = score1v1Series(oScores, isMoonBattle);
+        const cMetric = isSab ? sumAllHands1v1(cScores) : score1v1Series(cScores, isMoonBattle);
+        const oMetric = isSab ? sumAllHands1v1(oScores) : score1v1Series(oScores, isMoonBattle);
         const stake = Number(freshCh.stake || 2);
-        const diff = Math.abs(cAvg - oAvg);
-        const marginWon = Math.floor(diff);
+        const diff = Math.abs(cMetric - oMetric);
+        const marginWon = isSab ? Math.floor(diff / 4) : Math.floor(diff);
 
         let winnerTag = 'TIE';
         if (marginWon > 0) {
-          const challengerWins = isMoonBattle ? (cAvg < oAvg) : (cAvg > oAvg);
+          const challengerWins = isMoonBattle ? (cMetric < oMetric) : (cMetric > oMetric);
           winnerTag = challengerWins ? freshCh.challenger_tag : freshCh.opponent_tag;
         }
 
         patch.status = 'completed';
-        patch.challenger_avg = Number(cAvg.toFixed(2));
-        patch.opponent_avg = Number(oAvg.toFixed(2));
+        patch.challenger_avg = Number(cMetric.toFixed(2));
+        patch.opponent_avg = Number(oMetric.toFixed(2));
         patch.winner_tag = winnerTag;
         patch.coins_won = marginWon;
 
@@ -1293,6 +1499,9 @@ async function finishGame() {
       await supabase.from('challenges_1v1').update(patch).eq('id', chId);
       game.handsCompleted1v1 = updatedArr.length;
       game.isMoonBattle1v1 = isMoonBattle;
+      game.isSabotage1v1 = isSab;
+      game.needsSabotageDraft = isSab && updatedArr.length >= 1 && updatedArr.length <= 3;
+      game.sabotageDraftSubmitted = false;
       save('cotd_game', game);
       if (updatedArr.length >= 4) active1v1Id = null;
     }
@@ -1310,6 +1519,35 @@ async function finishGame() {
   renderHud();
 }
 
+function openSabotageResumedDraft(ch) {
+  const isChallenger = String(ch.challenger_tag).toUpperCase() === profile.tag;
+  const myScores = Array.isArray(isChallenger ? ch.challenger_scores : ch.opponent_scores)
+    ? (isChallenger ? ch.challenger_scores : ch.opponent_scores)
+    : [];
+  const lastHand = allGames.find(g => g.playerTag === profile.tag && g.boardSnapshot);
+  game = {
+    playerTag: profile.tag,
+    mode: '1v1',
+    challengeId: ch.id,
+    isMoonBattle: false,
+    isSabotage1v1: true,
+    moon: false,
+    grid: lastHand?.boardSnapshot?.grid || Array(16).fill(null),
+    crib: lastHand?.boardSnapshot?.crib || [],
+    cut: lastHand?.boardSnapshot?.cut || null,
+    done: true,
+    recordSaved: true,
+    scores: lastHand?.boardSnapshot?.scores || [0, 0, 0, 0, 0],
+    total: Number(myScores[myScores.length - 1] ?? 0),
+    finalTotalScore: Number(myScores[myScores.length - 1] ?? 0),
+    handsCompleted1v1: myScores.length,
+    needsSabotageDraft: true,
+    sabotageDraftSubmitted: false,
+  };
+  save('cotd_game', game);
+  render();
+}
+
 function showResult() {
   const box = root.querySelector('#result');
   if (!box) return;
@@ -1318,10 +1556,185 @@ function showResult() {
     ? '<div class="prediction-win">Exact Prediction Match! +5 Bonus Coins</div>'
     : `<p class="prediction-summary">Predicted: ${Number(game.predictedScore)} | Actual: ${Number(game.finalTotalScore ?? game.total)}</p>` : '';
   const is1v1 = game.mode === '1v1';
+  const isSab = Boolean(game.isSabotage1v1);
   const handsDone = Number(game.handsCompleted1v1 || 0);
-  const more1v1 = is1v1 && handsDone > 0 && handsDone < 4;
+
+  // Sabotage Draft Phase (after Hands 1, 2, or 3)
+  if (is1v1 && isSab && game.needsSabotageDraft && !game.sabotageDraftSubmitted) {
+    const roundNum = handsDone;
+    const cfg = SABOTAGE_ROUNDS[roundNum];
+    const chId = game.challengeId || active1v1Id;
+    const ch = allChallenges.find(x => String(x.id) === String(chId));
+    const isChallenger = ch ? String(ch.challenger_tag).toUpperCase() === profile.tag : true;
+    const sab = ch?.sabotage_state || defaultSabotageState();
+    const rivalBurned = isChallenger ? (sab.oBurned || []) : (sab.cBurned || []);
+
+    if (!game.sabotagePool || game.sabotagePoolRound !== roundNum) {
+      game.sabotagePool = makeDeck('', rivalBurned).slice(0, cfg.pool);
+      game.sabotagePoolRound = roundNum;
+      save('cotd_game', game);
+    }
+
+    let shieldChoice = null; // { type: 'row'|'col', idx: 0..3 }
+    let burnSelection = [];  // indices in game.sabotagePool
+    let revealSelection = []; // indices in game.sabotagePool (subset of burnSelection)
+
+    const getShieldCards = () => {
+      if (!shieldChoice) return [];
+      if (shieldChoice.type === 'row') {
+        const r = shieldChoice.idx;
+        const rowCards = [0, 1, 2, 3].map(c => game.grid[r * 4 + c]).filter(Boolean);
+        if (game.crib[r]) rowCards.push(game.crib[r]);
+        return rowCards;
+      }
+      const c = shieldChoice.idx;
+      return [0, 1, 2, 3].map(r => game.grid[r * 4 + c]).filter(Boolean);
+    };
+
+    const highlightShieldOnBoard = () => {
+      root.querySelectorAll('#grid .cell').forEach(cell => cell.classList.remove('shield-hl'));
+      if (!shieldChoice) return;
+      if (shieldChoice.type === 'row') {
+        root.querySelectorAll(`#grid .cell[data-r="${shieldChoice.idx}"]`).forEach(cell => cell.classList.add('shield-hl'));
+      } else {
+        root.querySelectorAll(`#grid .cell[data-c="${shieldChoice.idx}"]`).forEach(cell => cell.classList.add('shield-hl'));
+      }
+    };
+
+    const renderSabotageDraft = () => {
+      highlightShieldOnBoard();
+      const shieldCards = getShieldCards();
+      const ready = Boolean(shieldChoice) && burnSelection.length === cfg.burn && revealSelection.length === cfg.chooseReveal;
+
+      box.innerHTML = `<div class="felt result-card" style="text-align:left;">
+        <div class="eyebrow">🔥 SABOTAGE PHASE · AFTER HAND ${roundNum}/4 (HAND SCORE: ${game.finalTotalScore ?? game.total} PTS)</div>
+        <h3 style="margin:4px 0 8px; color:#f3d27a;">1. Secret Shield (Protect 1 Row or 1 Column)</h3>
+        <p style="font-size:12px; margin:0 0 6px; opacity:.9;">
+          If your opponent tries to burn any of your shielded cards, the burn fizzles! Rows shield <b>5 cards</b> (incl. Crib); Columns shield <b>4 cards</b>.
+        </p>
+        <div style="display:flex; gap:5px; flex-wrap:wrap; margin-bottom:4px;">
+          ${[0, 1, 2, 3].map(r => `<button type="button" class="btn small ${shieldChoice?.type === 'row' && shieldChoice.idx === r ? 'gold-btn' : ''}" data-sh-type="row" data-sh-idx="${r}">Row ${r + 1} (5)</button>`).join('')}
+        </div>
+        <div style="display:flex; gap:5px; flex-wrap:wrap; margin-bottom:10px;">
+          ${[0, 1, 2, 3].map(c => `<button type="button" class="btn small ${shieldChoice?.type === 'col' && shieldChoice.idx === c ? 'gold-btn' : ''}" data-sh-type="col" data-sh-idx="${c}">Hand ${c + 1} (4)</button>`).join('')}
+        </div>
+        ${shieldChoice ? `<div style="font-size:12px; color:#7cc4ff; margin-bottom:10px;">🛡️ Shielded (${shieldCards.length}): <b>${shieldCards.map(formatCardText).join(', ')}</b></div>` : ''}
+
+        <h3 style="margin:6px 0 4px; color:#f3d27a;">2. Burn ${cfg.burn} of ${cfg.pool} Rival Cards &amp; Expose ${cfg.chooseReveal}</h3>
+        <p style="font-size:12px; margin:0 0 8px; opacity:.9;">
+          Tap <b>${cfg.burn}</b> cards to burn (${burnSelection.length}/${cfg.burn}), then tap <b>👁️ Expose</b> on <b>${cfg.chooseReveal}</b> of them (${revealSelection.length}/${cfg.chooseReveal})${cfg.randomReveal ? ` — plus <b>${cfg.randomReveal} random</b> burned card will leak` : ''}.
+        </p>
+        <div class="sab-pool">
+          ${game.sabotagePool.map((c, idx) => {
+            const isBurned = burnSelection.includes(idx);
+            const isExposed = revealSelection.includes(idx);
+            const red = c.s === 1 || c.s === 2;
+            return `<div class="sab-slot">
+              <div class="card ${red ? 'red' : 'blk'} ${isBurned ? 'sab-burn' : ''}" data-sab-card="${idx}" style="cursor:pointer; margin:auto;">
+                <span class="r">${RANKS[c.r - 1]}</span><span class="s">${SUITS[c.s]}</span>
+              </div>
+              ${isBurned ? `<button type="button" class="btn small ${isExposed ? 'gold-btn' : ''}" data-sab-eye="${idx}" style="margin-top:4px; padding:3px 6px; font-size:11px;">${isExposed ? '👁️ Shown' : '🙈 Hide'}</button>` : '<div style="height:26px;"></div>'}
+            </div>`;
+          }).join('')}
+        </div>
+
+        <p class="error-text" id="sab-err" style="margin:6px 0;"></p>
+        <button class="btn gold-btn" id="lock-sabotage" type="button" style="width:100%; margin-top:6px;" ${ready ? '' : 'disabled'}>
+          🔥 Lock In Shield &amp; Sabotage
+        </button>
+      </div>`;
+
+      box.querySelectorAll('[data-sh-type]').forEach(btn => btn.onclick = () => {
+        shieldChoice = { type: btn.getAttribute('data-sh-type'), idx: Number(btn.getAttribute('data-sh-idx')) };
+        renderSabotageDraft();
+      });
+
+      box.querySelectorAll('[data-sab-card]').forEach(cardEl => cardEl.onclick = () => {
+        const idx = Number(cardEl.getAttribute('data-sab-card'));
+        if (burnSelection.includes(idx)) {
+          burnSelection = burnSelection.filter(i => i !== idx);
+          revealSelection = revealSelection.filter(i => i !== idx);
+        } else if (burnSelection.length < cfg.burn) {
+          burnSelection = [...burnSelection, idx];
+          if (revealSelection.length < cfg.chooseReveal) revealSelection = [...revealSelection, idx];
+        }
+        renderSabotageDraft();
+      });
+
+      box.querySelectorAll('[data-sab-eye]').forEach(eyeBtn => eyeBtn.onclick = () => {
+        const idx = Number(eyeBtn.getAttribute('data-sab-eye'));
+        if (!burnSelection.includes(idx)) return;
+        if (revealSelection.includes(idx)) {
+          revealSelection = revealSelection.filter(i => i !== idx);
+        } else if (revealSelection.length < cfg.chooseReveal) {
+          revealSelection = [...revealSelection, idx];
+        } else if (cfg.chooseReveal === 1) {
+          revealSelection = [idx];
+        }
+        renderSabotageDraft();
+      });
+
+      box.querySelector('#lock-sabotage').onclick = async () => {
+        if (!ready) return;
+        const submitBtn = box.querySelector('#lock-sabotage');
+        submitBtn.disabled = true;
+        submitBtn.textContent = 'Locking In…';
+
+        const { data: latestCh, error: loadErr } = await supabase.from('challenges_1v1').select('*').eq('id', chId).single();
+        if (loadErr || !latestCh) {
+          box.querySelector('#sab-err').textContent = 'Could not sync match. Try again.';
+          submitBtn.disabled = false;
+          submitBtn.textContent = '🔥 Lock In Shield & Sabotage';
+          return;
+        }
+
+        const iAmC = String(latestCh.challenger_tag).toUpperCase() === profile.tag;
+        let nextState = latestCh.sabotage_state ? { ...defaultSabotageState(), ...latestCh.sabotage_state } : defaultSabotageState();
+        const pendingKey = iAmC ? 'cPending' : 'oPending';
+        nextState[pendingKey] = {
+          round: roundNum,
+          shield: getShieldCards(),
+          burn: burnSelection.map(i => game.sabotagePool[i]),
+          chosenReveal: revealSelection.map(i => game.sabotagePool[i]),
+        };
+
+        if (nextState.cPending && nextState.oPending && nextState.cPending.round === roundNum && nextState.oPending.round === roundNum) {
+          nextState = resolveSabotageRound(nextState, roundNum);
+        }
+
+        const { error: upErr } = await supabase.from('challenges_1v1').update({ sabotage_state: nextState }).eq('id', chId);
+        if (upErr) {
+          box.querySelector('#sab-err').textContent = `Save failed: ${upErr.message}`;
+          submitBtn.disabled = false;
+          submitBtn.textContent = '🔥 Lock In Shield & Sabotage';
+          return;
+        }
+
+        game.needsSabotageDraft = false;
+        game.sabotageDraftSubmitted = true;
+        game.sabotagePool = null;
+        save('cotd_game', game);
+        await refreshCloudData();
+        showResult();
+      };
+    };
+
+    renderSabotageDraft();
+    return;
+  }
+
+  // Standard Post-Hand Result Panel
+  const chId = game.challengeId || active1v1Id;
+  const ch = is1v1 ? allChallenges.find(x => String(x.id) === String(chId)) : null;
+  const isChallenger = ch ? String(ch.challenger_tag).toUpperCase() === profile.tag : true;
+  const sab = ch?.sabotage_state || defaultSabotageState();
+  const waitingSabotage = is1v1 && isSab && handsDone < 4 && Boolean(isChallenger ? sab.cPending : sab.oPending);
+
+  const more1v1 = is1v1 && handsDone > 0 && handsDone < 4 && !waitingSabotage;
   const replayLabel = is1v1
-    ? (more1v1 ? `Play Hand ${handsDone + 1}/4` : '1v1 Hands Complete (4/4)')
+    ? (waitingSabotage
+        ? `Waiting for Rival's Round ${handsDone} Sabotage…`
+        : (more1v1 ? `Play Hand ${handsDone + 1}/4` : '1v1 Hands Complete (4/4)'))
     : 'Replay';
 
   box.innerHTML = `<div class="felt result-card" style="text-align:center"><h3>Total: ${game.finalTotalScore ?? game.total} points ${goal}</h3>
@@ -1333,7 +1746,7 @@ function showResult() {
     if (is1v1) {
       if (!more1v1) return;
       active1v1Id = game.challengeId || active1v1Id;
-      startGame('1v1', Boolean(game.isMoonBattle1v1), null, Boolean(game.isMoonBattle1v1));
+      startGame('1v1', Boolean(game.isMoonBattle1v1), null, Boolean(game.isMoonBattle1v1), isSab);
     } else {
       startGame(game.mode === 'daily' ? 'free' : game.mode, false, null);
     }
@@ -1381,7 +1794,8 @@ function showRules() {
 <h3>1v1 Arena (Best 3 of 4)</h3><p>2-Coin pay-in per player (max 1 match per opponent per day). Each player plays 4 hands; your top 3 scores are averaged. Winner gets their 2 Coins back plus the rounded-down average lead.<br>
 <b>🌙 Moon 1v1 Toggle:</b> Challenge someone to a dedicated Shoot the Moon battle where the <b>lowest</b> 3-of-4 average wins.<br>
 <b>Standard 1v1 Moon Gamble:</b> Toggle Shoot the Moon during a standard 1v1 hand—if you hit ≤10, it counts as <b>55 pts</b>! If you miss, it counts as your regular score, and if it is your dropped lowest hand, you take a <b>−2 pt</b> penalty on your 3-hand average.<br>
-Matches not completed within 24 hours forfeit automatically with a full 2-Coin refund and no stat impact.</p>`);
+Matches not completed within 24 hours forfeit automatically with a full 2-Coin refund and no stat impact.<br>
+<b>🔥 Sabotage 1v1:</b> 4-hand cumulative total (Moon disabled; payout = <code>⌊lead ÷ 4⌋</code> Coins). After Hands 1, 2, and 3, secretly shield <b>1 Row (5 cards incl. Crib)</b> or <b>1 Column (4 cards)</b> to block incoming burns, then burn <b>2 of 4 → 4 of 6 → 6 of 8</b> cards from your rival's deck permanently (exposing <b>1 → 2 → 3</b> while the rest stay hidden).</p>`);
 }
 
 function stats(scores, isMoon = false) {
@@ -1641,10 +2055,11 @@ ${(() => {
         const theirScores = Array.isArray(isChallenger ? c.opponent_scores : c.challenger_scores)
           ? (isChallenger ? c.opponent_scores : c.challenger_scores)
           : [];
+       const isSab = isSabotageMatch(c);
         const isMoon1v1 = Boolean(c.is_moon_battle);
-        const myTop3 = top3Total1v1(myScores, isMoon1v1);
-        const theirTop3 = top3Total1v1(theirScores, isMoon1v1);
-        return { c, rival, isMoon1v1, myTop3, theirTop3, ts: new Date(c.created_at).getTime() || 0 };
+        const myTop3 = isSab ? sumAllHands1v1(myScores) : top3Total1v1(myScores, isMoon1v1);
+        const theirTop3 = isSab ? sumAllHands1v1(theirScores) : top3Total1v1(theirScores, isMoon1v1);
+        return { c, rival, isSab, isMoon1v1, myTop3, theirTop3, ts: new Date(c.created_at).getTime() || 0 };
       });
 
     if (sort1v1Mode === 'newest') items.sort((a, b) => b.ts - a.ts);
@@ -1652,7 +2067,7 @@ ${(() => {
     else if (sort1v1Mode === 'highest') items.sort((a, b) => b.myTop3 - a.myTop3);
     else if (sort1v1Mode === 'lowest') items.sort((a, b) => a.myTop3 - b.myTop3);
 
-    boxWrap.innerHTML = items.map(({ c, rival, isMoon1v1, myTop3, theirTop3 }) => {
+    boxWrap.innerHTML = items.map(({ c, rival, isSab, isMoon1v1, myTop3, theirTop3 }) => {
       const margin = Number(c.coins_won || 0);
       const won = c.winner_tag === profile.tag;
       const tie = c.winner_tag === 'TIE';
@@ -1660,15 +2075,15 @@ ${(() => {
       const color = tie ? '#f3d27a' : (won ? '#7ee787' : '#ff8b8b');
       return `<div class="row" style="padding:8px; border:1px solid rgba(255,255,255,.2); border-radius:8px; background:rgba(0,0,0,.28); margin:5px 0; gap:8px;">
         <div style="font-size:12px; flex:1;">
-          <b>vs ${escapeHTML(rival)}</b> · ${isMoon1v1 ? '🌙 Moon' : '⚔️ Regular'} · <span style="opacity:.75;">${escapeHTML(c.date_key)}</span><br>
+          <b>vs ${escapeHTML(rival)}</b> · ${isSab ? '🔥 Sabotage' : (isMoon1v1 ? '🌙 Moon' : '⚔️ Regular')} · <span style="opacity:.75;">${escapeHTML(c.date_key)}</span><br>
           <span style="color:${color}; font-weight:700;">${outcome}</span>
         </div>
         <div style="text-align:right; font-size:12px; padding:4px 8px; border-radius:6px; background:rgba(243,210,122,.1);">
-          <div style="font-size:10px; opacity:.8;">TOP-3 SCORE</div>
+          <div style="font-size:10px; opacity:.8;">${isSab ? '4-HAND TOTAL' : 'TOP-3 SCORE'}</div>
           <b>You ${myTop3}</b> vs <b>${theirTop3}</b>
         </div>
       </div>`;
-    }).join('') || '<p class="empty-note">No completed 1v1 matches yet.</p>';
+}).join('') || '<p class="empty-note">No completed 1v1 matches yet.</p>';
   };
 
   m.querySelectorAll('#sort-1v1-tabs .tab-pill').forEach(btn => btn.onclick = () => {
@@ -1725,6 +2140,54 @@ ${(() => {
     return `${w.length}W–${l.length}L (${net >= 0 ? '+' : ''}${net}🪙)`;
   };
 
+  const getDirectRivalry1v1 = (myTag, oppTag, lim) => {
+    let matchesBetween = allChallenges.filter(c =>
+      c.status === 'completed' &&
+      ((c.challenger_tag === myTag && c.opponent_tag === oppTag) ||
+       (c.challenger_tag === oppTag && c.opponent_tag === myTag))
+    );
+    if (lim === '10') matchesBetween = matchesBetween.slice(0, 10);
+
+    let wins = 0;
+    let losses = 0;
+    let ties = 0;
+    let netCoins = 0;
+    let myRawPts = 0;
+    let oppRawPts = 0;
+
+    const sumRawHandScores = arr => (Array.isArray(arr) ? arr : []).reduce((sum, item) => {
+      const val = typeof item === 'object' && item !== null ? Number(item.score) : Number(item);
+      return sum + (Number.isFinite(val) ? val : 0);
+    }, 0);
+
+    for (const c of matchesBetween) {
+      const iAmChallenger = c.challenger_tag === myTag;
+      myRawPts += sumRawHandScores(iAmChallenger ? c.challenger_scores : c.opponent_scores);
+      oppRawPts += sumRawHandScores(iAmChallenger ? c.opponent_scores : c.challenger_scores);
+
+      const margin = Number(c.coins_won || 0);
+      if (c.winner_tag === 'TIE') {
+        ties++;
+      } else if (c.winner_tag === myTag) {
+        wins++;
+        netCoins += margin;
+      } else if (c.winner_tag === oppTag) {
+        losses++;
+        netCoins -= margin;
+      }
+    }
+
+    return {
+      played: matchesBetween.length,
+      wins,
+      losses,
+      ties,
+      netCoins,
+      myRawPts,
+      oppRawPts,
+    };
+  };
+
   const renderComparison = () => {
     if (!selectedOpponent) { comparison.innerHTML = ''; return; }
     const myFiltered = sliceByLimit(allGames.filter(g => g.playerTag === profile.tag && g.isMoonShot === moonCompare));
@@ -1752,6 +2215,27 @@ ${(() => {
     ].join('');
 
     const scope1v1 = compareLimit === '10' ? 'Last 10' : 'All-Time';
+    const rivalry = getDirectRivalry1v1(profile.tag, selectedOpponent, compareLimit);
+    const coinColor = rivalry.netCoins > 0 ? '#7ee787' : rivalry.netCoins < 0 ? '#ff8b8b' : '#f3d27a';
+    const rivalryHTML = rivalry.played === 0
+      ? `<div style="font-size:12px; padding:8px; margin-top:6px; border-radius:8px; border:1px solid rgba(243,210,122,.3); background:rgba(0,0,0,.28); text-align:center; opacity:.85;">
+          No completed 1v1 matches directly against <b>${escapeHTML(selectedOpponent)}</b> yet.
+        </div>`
+      : `<div style="margin-top:8px; padding:8px 10px; border-radius:8px; border:1px solid rgba(243,210,122,.45); background:rgba(0,0,0,.35); font-size:12px;">
+          <div class="eyebrow" style="margin-bottom:4px;">DIRECT 1V1 RIVALRY · YOU VS ${escapeHTML(selectedOpponent)} (${scope1v1})</div>
+          <div style="display:flex; justify-content:space-between; margin:3px 0;">
+            <span>Record (${rivalry.played} ${rivalry.played === 1 ? 'match' : 'matches'}):</span>
+            <b>${rivalry.wins}W – ${rivalry.losses}L${rivalry.ties ? ` – ${rivalry.ties}T` : ''}</b>
+          </div>
+          <div style="display:flex; justify-content:space-between; margin:3px 0;">
+            <span>Total Raw Points Scored:</span>
+            <b>You ${rivalry.myRawPts} vs ${rivalry.oppRawPts}</b>
+          </div>
+          <div style="display:flex; justify-content:space-between; margin:3px 0;">
+            <span>Net Coins vs ${escapeHTML(selectedOpponent)}:</span>
+            <b style="color:${coinColor};">${rivalry.netCoins >= 0 ? '+' : ''}${rivalry.netCoins}🪙</b>
+          </div>
+        </div>`;
 
     comparison.innerHTML = `<div class="head-to-head">
       <div class="head-to-head-title">
@@ -1767,8 +2251,9 @@ ${(() => {
         <thead><tr><th>Stat</th><th>You<br>${escapeHTML(profile.tag)}</th><th>Opponent<br>${escapeHTML(selectedOpponent)}</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>
+      ${rivalryHTML}
       <div style="display:flex; justify-content:space-between; font-size:12px; padding:6px 8px; margin-top:6px; border-radius:8px; background:rgba(0,0,0,.3);">
-        <span>⚔️ 1v1 (${scope1v1}): <b>${get1v1Summary(profile.tag, compareLimit)}</b></span>
+        <span>Overall 1v1 (${scope1v1}): <b>${get1v1Summary(profile.tag, compareLimit)}</b></span>
         <span>Them: <b>${get1v1Summary(selectedOpponent, compareLimit)}</b></span>
       </div>
     </div>`;
