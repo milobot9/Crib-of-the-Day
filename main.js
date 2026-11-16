@@ -1212,6 +1212,7 @@ async function startGame(mode, moon, predictedScore, isMoonBattle = false, isSab
         excluded = isC ? (sab.cBurned || []) : (sab.oBurned || []);
       }
     }
+  }
   const deck = makeDeck(mode === 'daily' ? `cotd-${todayKey()}` : '', excluded);
   const forceMoon = mode === '1v1' && Boolean(isMoonBattle);
   const disableMoon = mode === '1v1' && Boolean(isSabotage);
@@ -1273,13 +1274,30 @@ function getLive1v1BoxHTML() {
     const myKnown = isChallenger ? (sab.cKnown || []) : (sab.oKnown || []);
     const mySaved = isChallenger ? (sab.cSavedLast || []) : (sab.oSavedLast || []);
     const hiddenCount = Math.max(0, myBurned.length - myKnown.length);
-    const knownList = myKnown.length ? myKnown.map(formatCardText).join(', ') : 'None';
+
+    const knownChips = myKnown.map(c => {
+      const isRed = c.s === 1 || c.s === 2;
+      return `<span class="grave-chip ${isRed ? 'red' : 'blk'}">${formatCardText(c)}</span>`;
+    }).join('');
+
+    const hiddenChips = Array.from({ length: hiddenCount }, () =>
+      `<span class="grave-chip hidden" title="Burned card hidden in fog of war">🔥?</span>`
+    ).join('');
+
+    const chipsContent = (knownChips || hiddenChips)
+      ? `${knownChips}${hiddenChips}`
+      : `<span style="opacity:.7; font-size:12px;">No cards burned from your deck yet</span>`;
+
     const savedNote = mySaved.length
-      ? `<div style="color:#7ee787; margin-top:2px;">🛡️ Shield blocked last turn: <b>${mySaved.map(formatCardText).join(', ')}</b></div>`
+      ? `<div class="grave-shield-note">🛡️ Shield blocked last turn: ${mySaved.map(c => `<span class="grave-chip shield ${c.s === 1 || c.s === 2 ? 'red' : 'blk'}">${formatCardText(c)}</span>`).join('')}</div>`
       : '';
 
-    graveyardHTML = `<div style="margin-top:6px; padding-top:6px; border-top:1px solid rgba(255,255,255,.15); font-size:11px; opacity:.95;">
-      🔥 <b>Deck: ${52 - myBurned.length}/52 left</b> · Known Burned: <b>${escapeHTML(knownList)}</b>${hiddenCount ? ` <i>(+${hiddenCount} hidden)</i>` : ''}
+    graveyardHTML = `<div class="graveyard-box">
+      <div class="graveyard-head">
+        <span>🔥 GRAVEYARD · GONE FROM YOUR DECK</span>
+        <span class="grave-deck-pill">${52 - myBurned.length}/52 CARDS LEFT</span>
+      </div>
+      <div class="grave-chips">${chipsContent}</div>
       ${savedNote}
     </div>`;
   }
