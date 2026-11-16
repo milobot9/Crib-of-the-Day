@@ -860,10 +860,9 @@ const inboxHTML = activeToday.map(c => {
     const myPending = isChallenger ? sab.cPending : sab.oPending;
     const theirPending = isChallenger ? sab.oPending : sab.cPending;
 
-    const needsMyDraft = isSab && myScores.length >= 1 && myScores.length <= 3 && !myPending
-      && (myScores.length > theirScores.length || Boolean(theirPending));
-    const waitingOnRivalDraft = isSab && !needsMyDraft && myScores.length < 4 && (
-      Boolean(myPending) || (myScores.length > theirScores.length)
+    const needsMyDraft = isSab && myScores.length >= 1 && myScores.length <= 3 && !myPending;
+    const waitingOnRivalDraft = isSab && !needsMyDraft && myScores.length >= 1 && myScores.length < 4 && (
+      Boolean(myPending) || Boolean(theirPending) || (myScores.length > theirScores.length)
     );
 
     const myDone = myScores.length >= 4 || waitingOnRivalDraft;
@@ -1184,15 +1183,35 @@ const inboxHTML = activeToday.map(c => {
   };
 }
 
-function startGame(mode, moon, predictedScore, isMoonBattle = false, isSabotage = false) {
+async function startGame(mode, moon, predictedScore, isMoonBattle = false, isSabotage = false) {
   let excluded = [];
-  if (mode === '1v1' && isSabotage && active1v1Id) {
-    const ch = allChallenges.find(x => String(x.id) === String(active1v1Id));
-    if (ch?.sabotage_state) {
-      const isChallenger = String(ch.challenger_tag).toUpperCase() === profile.tag;
-      excluded = isChallenger ? (ch.sabotage_state.cBurned || []) : (ch.sabotage_state.oBurned || []);
+  if (mode === '1v1' && active1v1Id) {
+    const { data: fresh } = await supabase.from('challenges_1v1').select('*').eq('id', active1v1Id).maybeSingle();
+    if (fresh) {
+      allChallenges = allChallenges.map(x => String(x.id) === String(fresh.id) ? fresh : x);
+      const isC = String(fresh.challenger_tag).toUpperCase() === profile.tag;
+      const myS = Array.isArray(isC ? fresh.challenger_scores : fresh.opponent_scores)
+        ? (isC ? fresh.challenger_scores : fresh.opponent_scores) : [];
+      const theirS = Array.isArray(isC ? fresh.opponent_scores : fresh.challenger_scores)
+        ? (isC ? fresh.opponent_scores : fresh.challenger_scores) : [];
+      if (isSabotage || isSabotageMatch(fresh)) {
+        isSabotage = true;
+        const sab = fresh.sabotage_state || defaultSabotageState();
+        const myPend = isC ? sab.cPending : sab.oPending;
+        const theirPend = isC ? sab.oPending : sab.cPending;
+        if (myS.length >= 1 && myS.length <= 3 && !myPend) {
+          openSabotageResumedDraft(fresh);
+          return;
+        }
+        if (myS.length >= 1 && myS.length < 4 && (myPend || theirPend || myS.length > theirS.length)) {
+          game = null;
+          save('cotd_game', null);
+          render();
+          return;
+        }
+        excluded = isC ? (sab.cBurned || []) : (sab.oBurned || []);
+      }
     }
-  }
   const deck = makeDeck(mode === 'daily' ? `cotd-${todayKey()}` : '', excluded);
   const forceMoon = mode === '1v1' && Boolean(isMoonBattle);
   const disableMoon = mode === '1v1' && Boolean(isSabotage);
@@ -1729,7 +1748,13 @@ function showResult() {
   const ch = is1v1 ? allChallenges.find(x => String(x.id) === String(chId)) : null;
   const isChallenger = ch ? String(ch.challenger_tag).toUpperCase() === profile.tag : true;
   const sab = ch?.sabotage_state || defaultSabotageState();
-  const waitingSabotage = is1v1 && isSab && handsDone < 4 && Boolean(isChallenger ? sab.cPending : sab.oPending);
+ const theirScores = ch && Array.isArray(isChallenger ? ch.opponent_scores : ch.challenger_scores)
+    ? (isChallenger ? ch.opponent_scores : ch.challenger_scores) : [];
+  const waitingSabotage = is1v1 && isSab && handsDone < 4 && (
+    Boolean(isChallenger ? sab.cPending : sab.oPending) ||
+    Boolean(isChallenger ? sab.oPending : sab.cPending) ||
+    handsDone > theirScores.length
+  );
 
   const more1v1 = is1v1 && handsDone > 0 && handsDone < 4 && !waitingSabotage;
   const replayLabel = is1v1
