@@ -383,6 +383,7 @@ function defaultSabotageState() {
     oSavedLast: [],
     cPending: null,
     oPending: null,
+    resolvedRounds: [],
   };
 }
 
@@ -451,6 +452,7 @@ function resolveSabotageRound(state, roundNum) {
   const oppRes = applyAttack(state.cPending, state.oPending.shield, state.oBurned, state.oKnown);
   const chalRes = applyAttack(state.oPending, state.cPending.shield, state.cBurned, state.cKnown);
 
+  const prevResolved = Array.isArray(state.resolvedRounds) ? state.resolvedRounds : [];
   return {
     cBurned: chalRes.nextBurned,
     oBurned: oppRes.nextBurned,
@@ -458,8 +460,9 @@ function resolveSabotageRound(state, roundNum) {
     oKnown: oppRes.nextKnown,
     cSavedLast: chalRes.saved,
     oSavedLast: oppRes.saved,
-   cPending: null,
+    cPending: null,
     oPending: null,
+    resolvedRounds: prevResolved.includes(roundNum) ? prevResolved : [...prevResolved, roundNum],
   };
 }
 
@@ -860,8 +863,10 @@ const inboxHTML = activeToday.map(c => {
     const myPending = isChallenger ? sab.cPending : sab.oPending;
     const theirPending = isChallenger ? sab.oPending : sab.cPending;
 
-    const needsMyDraft = isSab && myScores.length >= 1 && myScores.length <= 3 && !myPending;
-    const waitingOnRivalDraft = isSab && !needsMyDraft && myScores.length >= 1 && myScores.length < 4 && (
+    const resolvedRounds = Array.isArray(sab.resolvedRounds) ? sab.resolvedRounds : [];
+    const roundResolved = resolvedRounds.includes(myScores.length);
+    const needsMyDraft = isSab && myScores.length >= 1 && myScores.length <= 3 && !myPending && !roundResolved;
+    const waitingOnRivalDraft = isSab && !needsMyDraft && !roundResolved && myScores.length >= 1 && myScores.length < 4 && (
       Boolean(myPending) || Boolean(theirPending) || (myScores.length > theirScores.length)
     );
 
@@ -959,8 +964,8 @@ const inboxHTML = activeToday.map(c => {
             <br>• After Hand 2: Burn <b>4 of 6</b> rival cards → pick <b>1</b> to show + <b>1 random</b> leaks (2 hidden).
             <br>• After Hand 3: Burn <b>6 of 8</b> rival cards → pick <b>2</b> to show + <b>1 random</b> leaks (3 hidden).
           </li>
-          <li><b>4. Permanent Deck Rot:</b> Unshielded burned cards stay gone for the rest of the match (down to 40/52 cards in Hand 4).</li>
-        </ul>
+          <li><b>4. Permanent Deck Rot &amp; Graveyard Key:</b> Unshielded burned cards stay gone for the rest of the match. In your Graveyard: <b>Pink</b> = burned Red suits (♥/♦), <b>Blue</b> = burned Black suits (♠/♣), <b>🔥?</b> = hidden burned cards, and <b>Green</b> = saved by your Shield.</li>
+      </ul>
       </div>
       <p style="margin:4px 0 8px; font-size:12px;">Challenge each rival up to once in <b>Regular</b>, <b>Moon</b>, and <b>Sabotage</b> per day (2🪙 each). Matches reset at midnight—unfinished games forfeit with a full 2-Coin refund.</p>
       <div class="compare-search-row">
@@ -1132,13 +1137,12 @@ const inboxHTML = activeToday.map(c => {
 
     active1v1Id = ch.id;
     const isSab = isSabotageMatch(ch);
-    if (isSab) {
+   if (isSab) {
       const sab = ch.sabotage_state || defaultSabotageState();
+      const resolvedRounds = Array.isArray(sab.resolvedRounds) ? sab.resolvedRounds : [];
+      const roundResolved = resolvedRounds.includes(myScores.length);
       const myPending = isChallenger ? sab.cPending : sab.oPending;
-      const theirPending = isChallenger ? sab.oPending : sab.cPending;
-      const needsDraft = myScores.length >= 1 && myScores.length <= 3 && !myPending
-        && (myScores.length > theirScores.length || Boolean(theirPending));
-      if (needsDraft) {
+      if (myScores.length >= 1 && myScores.length <= 3 && !myPending && !roundResolved) {
         openSabotageResumedDraft(ch);
         return;
       }
@@ -1197,13 +1201,15 @@ async function startGame(mode, moon, predictedScore, isMoonBattle = false, isSab
       if (isSabotage || isSabotageMatch(fresh)) {
         isSabotage = true;
         const sab = fresh.sabotage_state || defaultSabotageState();
+        const resolvedRounds = Array.isArray(sab.resolvedRounds) ? sab.resolvedRounds : [];
+        const roundResolved = resolvedRounds.includes(myS.length);
         const myPend = isC ? sab.cPending : sab.oPending;
         const theirPend = isC ? sab.oPending : sab.cPending;
-        if (myS.length >= 1 && myS.length <= 3 && !myPend) {
+        if (myS.length >= 1 && myS.length <= 3 && !myPend && !roundResolved) {
           openSabotageResumedDraft(fresh);
           return;
         }
-        if (myS.length >= 1 && myS.length < 4 && (myPend || theirPend || myS.length > theirS.length)) {
+        if (myS.length >= 1 && myS.length < 4 && !roundResolved && (myPend || theirPend || myS.length > theirS.length)) {
           game = null;
           save('cotd_game', null);
           render();
@@ -1768,7 +1774,9 @@ function showResult() {
   const sab = ch?.sabotage_state || defaultSabotageState();
  const theirScores = ch && Array.isArray(isChallenger ? ch.opponent_scores : ch.challenger_scores)
     ? (isChallenger ? ch.opponent_scores : ch.challenger_scores) : [];
-  const waitingSabotage = is1v1 && isSab && handsDone < 4 && (
+  const resolvedRounds = Array.isArray(sab.resolvedRounds) ? sab.resolvedRounds : [];
+  const roundResolved = resolvedRounds.includes(handsDone);
+  const waitingSabotage = is1v1 && isSab && handsDone < 4 && !roundResolved && (
     Boolean(isChallenger ? sab.cPending : sab.oPending) ||
     Boolean(isChallenger ? sab.oPending : sab.cPending) ||
     handsDone > theirScores.length
@@ -1796,6 +1804,18 @@ function showResult() {
     }
   };
   box.querySelector('#back').onclick = () => { game = null; save('cotd_game', null); render(); };
+if (waitingSabotage) {
+    const pollTimer = setInterval(async () => {
+      if (!game || !game.done || game.mode !== '1v1') { clearInterval(pollTimer); return; }
+      await refreshCloudData();
+      const latest = allChallenges.find(x => String(x.id) === String(chId));
+      const latestSab = latest?.sabotage_state || defaultSabotageState();
+      if (Array.isArray(latestSab.resolvedRounds) && latestSab.resolvedRounds.includes(handsDone)) {
+        clearInterval(pollTimer);
+        showResult();
+      }
+    }, 3000);
+  }
 }
 
 function modal(html) {
@@ -1839,7 +1859,7 @@ function showRules() {
 <b>🌙 Moon 1v1 Toggle:</b> Challenge someone to a dedicated Shoot the Moon battle where the <b>lowest</b> 3-of-4 average wins.<br>
 <b>Standard 1v1 Moon Gamble:</b> Toggle Shoot the Moon during a standard 1v1 hand—if you hit ≤10, it counts as <b>55 pts</b>! If you miss, it counts as your regular score, and if it is your dropped lowest hand, you take a <b>−2 pt</b> penalty on your 3-hand average.<br>
 Matches not completed within 24 hours forfeit automatically with a full 2-Coin refund and no stat impact.<br>
-<b>🔥 Sabotage 1v1:</b> 4-hand cumulative total (Moon disabled; payout = <code>⌊lead ÷ 4⌋</code> Coins). After Hands 1, 2, and 3, secretly shield <b>1 Row (5 cards incl. Crib)</b> or <b>1 Column (4 cards)</b> to block incoming burns, then burn <b>2 of 4 → 4 of 6 → 6 of 8</b> cards from your rival's deck permanently (exposing <b>1 → 2 → 3</b> while the rest stay hidden).</p>`);
+<b>🔥 Sabotage 1v1:</b> 4-hand cumulative total (Moon disabled; payout = <code>⌊lead ÷ 4⌋</code> Coins). After Hands 1, 2, and 3, secretly shield <b>1 Row (5 cards incl. Crib)</b> or <b>1 Column (4 cards)</b> to block incoming burns, then burn <b>2 of 4 → 4 of 6 → 6 of 8</b> cards from your rival's deck permanently (exposing <b>1 → 2 → 3</b> while the rest stay hidden). <i>Graveyard key:</i> Pink = burned ♥/♦, Blue = burned ♠/♣, 🔥? = hidden burned card, Green = blocked by Shield.</p>`);
 }
 
 function stats(scores, isMoon = false) {
